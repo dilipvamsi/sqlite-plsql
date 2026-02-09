@@ -10,8 +10,20 @@ import "core:strings"
 tracking_allocator: mem.Tracking_Allocator
 tracking_allocator_initialized: bool = false
 
+@(thread_local)
+temp_arena: mem.Arena
+temp_arena_initialized: bool = false
+
 plsqlite_context :: proc() -> runtime.Context {
 	ctx := runtime.default_context()
+
+	if !temp_arena_initialized {
+		// Use a reasonable initial size, it will grow if needed because we use the default allocator as backing
+		arena_buf := make([]byte, 64 * 1024)
+		mem.arena_init(&temp_arena, arena_buf)
+		temp_arena_initialized = true
+	}
+	ctx.temp_allocator = mem.arena_allocator(&temp_arena)
 
 	if DEBUG_ENABLED {
 		if !tracking_allocator_initialized {
@@ -28,6 +40,7 @@ plsqlite_context :: proc() -> runtime.Context {
 // Note: PL/SQL runtime memory usage is not tracked here when using the default allocator.
 __plsql_leak_report :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 
 	used := memory_used()
 	high := memory_highwater(0)
@@ -55,5 +68,19 @@ __plsql_leak_report :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 	fmt.printf("===========================\n")
 
 	msg := fmt.tprintf("Used: %d, High: %d", used, high)
-	result_text(ctx, strings.clone_to_cstring(msg), -1, SQLITE_TRANSIENT)
+	c_msg := strings.clone_to_cstring(msg)
+	defer delete(c_msg)
+	result_text(ctx, c_msg, -1, SQLITE_TRANSIENT)
+}
+
+// __plsql_reset clears the tracking allocator to distinguish tracker overhead from real leaks.
+// Note: We don't destroy it anymore to avoid invalid reads when connection closes later.
+__plsql_reset :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
+	context = plsqlite_context()
+	if tracking_allocator_initialized {
+		clear(&tracking_allocator.allocation_map)
+		tracking_allocator.total_allocation_count = 0
+		tracking_allocator.total_free_count = 0
+	}
+	result_null(ctx)
 }

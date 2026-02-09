@@ -3,15 +3,39 @@
 
 /* Comprehensive leak check covering all PL/SQLite functions and code paths */
 
-int exec_sql(sqlite3 *db, const char *sql, const char *desc) {
+int callback(void *data, int argc, char **argv, char **azColName) {
+  // data is the 4th argument passed to sqlite3_exec (we use it here to check
+  // verbose)
+  for (int i = 0; i < argc; i++) {
+    printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
+  }
+  printf("\n");
+  return 0;
+}
+
+int exec_sql_verbose(sqlite3 *db, const char *sql, const char *desc,
+                     int verbose) {
   char *err = 0;
-  int rc = sqlite3_exec(db, sql, 0, 0, &err);
+
+  if (verbose) {
+    printf("Executing SQL (%s): %s\n", desc, sql);
+  }
+
+  // 2. Pass the 'callback' function to sqlite3_exec.
+  // If verbose is 0, we pass 0 (NULL) so it doesn't print anything.
+  int rc = sqlite3_exec(db, sql, verbose ? callback : 0, 0, &err);
+
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Error in %s: %s\n", desc, err);
-    sqlite3_free(err);
+    sqlite3_free(err); // Essential to prevent memory leaks!
     return 1;
   }
+
   return 0;
+}
+
+int exec_sql(sqlite3 *db, const char *sql, const char *desc) {
+  return exec_sql_verbose(db, sql, desc, 0);
 }
 
 int main() {
@@ -308,8 +332,20 @@ int main() {
     sqlite3_exec(db, "SELECT run_plsql('p_parent_fail');", 0, 0, 0);
   }
 
+  printf("=== Testing procedure management (replace/unregister) stress ===\n");
+  for (int i = 0; i < 50; i++) {
+    exec_sql(db, "SELECT register_plsql('p_manage', '', 'RETURN 1;');",
+             "register p_manage");
+    exec_sql(db, "SELECT run_plsql('p_manage');", "run p_manage v1");
+    exec_sql(db, "SELECT replace_plsql('p_manage', '', 'RETURN 2;');",
+             "replace p_manage");
+    exec_sql(db, "SELECT run_plsql('p_manage');", "run p_manage v2");
+    exec_sql(db, "SELECT unregister_plsql('p_manage');", "unregister p_manage");
+  }
+
   printf("Execution finished. Closing database...\n");
-  exec_sql(db, "SELECT __plsql_leak_report();", "leak report");
+  exec_sql(db, "SELECT __plsql_reset();", "reset plsql");
+  exec_sql_verbose(db, "SELECT __plsql_leak_report();", "leak report", 1);
   sqlite3_close(db);
 
   printf("Leak check completed. Run this with Valgrind for detailed report.\n");

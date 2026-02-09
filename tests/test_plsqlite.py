@@ -753,5 +753,45 @@ class TestPLSQLite(unittest.TestCase):
         count = self.conn.execute("SELECT COUNT(*) FROM nested_rollback;").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_replace_procedure(self):
+        # 1. Register version 1
+        self.conn.execute("SELECT register_plsql('replace_test', '', 'RETURN 1;');")
+        res = self.conn.execute("SELECT run_plsql('replace_test');").fetchone()[0]
+        self.assertEqual(res, 1)
+
+        # 2. Replace with version 2
+        self.conn.execute("SELECT replace_plsql('replace_test', '', 'RETURN 2;');")
+        res = self.conn.execute("SELECT run_plsql('replace_test');").fetchone()[0]
+        self.assertEqual(res, 2)
+
+        # 3. Register again (UPSERT) with version 3
+        self.conn.execute("SELECT register_plsql('replace_test', '', 'RETURN 3;');")
+        res = self.conn.execute("SELECT run_plsql('replace_test');").fetchone()[0]
+        self.assertEqual(res, 3)
+
+    def test_unregister_procedure(self):
+        # 1. Register
+        self.conn.execute("SELECT register_plsql('unreg_test', '', 'RETURN 123;');")
+        res = self.conn.execute("SELECT run_plsql('unreg_test');").fetchone()[0]
+        self.assertEqual(res, 123)
+
+        # 2. Unregister
+        self.conn.execute("SELECT unregister_plsql('unreg_test');")
+
+        # 3. Should error
+        with self.assertRaisesRegex(sqlite3.OperationalError, "Procedure not found"):
+            self.conn.execute("SELECT run_plsql('unreg_test');")
+
+    def test_cache_invalidation_across_calls(self):
+        # This tests that the in-memory Procedure object is updated
+        self.conn.execute("SELECT register_plsql('cache_test', 'x', 'RETURN @x + 10;');")
+        res = self.conn.execute("SELECT run_plsql('cache_test', 5);").fetchone()[0]
+        self.assertEqual(res, 15)
+
+        # Replace with different logic
+        self.conn.execute("SELECT replace_plsql('cache_test', 'x', 'RETURN @x * 2;');")
+        res = self.conn.execute("SELECT run_plsql('cache_test', 5);").fetchone()[0]
+        self.assertEqual(res, 10)
+
 if __name__ == "__main__":
     unittest.main()

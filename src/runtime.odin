@@ -74,10 +74,12 @@ destroy_connection_context :: proc(ctx: ^ConnectionContext) {
 close_hook :: proc "c" (t: c.uint, db_ptr: rawptr, p: rawptr, x: rawptr) -> c.int {
 	if t != SQLITE_TRACE_CLOSE do return 0
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	ctx := (^ConnectionContext)(db_ptr) // db_ptr is the pCtx argument passed to trace_v2
 	if ctx != nil && ctx.magic == CONNECTION_CONTEXT_MAGIC {
 		log_debug("Close Hook: Magic Validated")
 		finalize_all_statements(ctx)
+		ctx_release(ctx)
 	} else {
 		log_debug("Close Hook: INVALID MAGIC %p (expected context in db_ptr)", db_ptr)
 	}
@@ -87,6 +89,7 @@ close_hook :: proc "c" (t: c.uint, db_ptr: rawptr, p: rawptr, x: rawptr) -> c.in
 // ctx_release is an xDestroy callback for SQLite functions to handle reference-counted cleanup.
 ctx_release :: proc "c" (pApp: rawptr) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	ctx := (^ConnectionContext)(pApp)
 	if ctx == nil do return
 
@@ -392,6 +395,7 @@ free_procedure_cache :: proc(ctx: ^ConnectionContext) {
 		}
 		delete(p.stmts_pool)
 		delete(p.transpiled_sql)
+		delete(p.args_def)
 		delete(p.name)
 		free(p)
 	}
@@ -447,6 +451,7 @@ exec_callback :: proc "c" (
 @(export)
 __env_set :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil do return
 
@@ -543,6 +548,7 @@ __env_set :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_va
 @(export)
 __env_get :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil do return
 
@@ -598,6 +604,7 @@ __env_get :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_va
 @(export)
 __env_return :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil do return
 
@@ -645,6 +652,7 @@ __env_return :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 @(export)
 __env_raise :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil do return
 
@@ -663,6 +671,7 @@ __env_raise :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_
 @(export)
 os_getenv :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	if nArg < 1 {
 		result_null(ctx)
 		return
@@ -706,6 +715,7 @@ cond_callback :: proc "c" (
 @(export)
 __run_if :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 
@@ -755,6 +765,7 @@ __run_if :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_val
 @(export)
 __proc_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 
@@ -841,6 +852,7 @@ extract_column_value :: proc(stmt: ^sqlite3_stmt, i: c.int) -> SqliteValue {
 @(export)
 __range_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	defer free_all(context.temp_allocator)
 	conn := (^ConnectionContext)(user_data(ctx))
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 

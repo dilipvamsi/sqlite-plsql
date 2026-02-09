@@ -44,18 +44,23 @@ LIB_USER32     = $(WIN_LIBS)/sdk/lib/um/x86_64/user32.lib
 LIB_SHELL32    = $(WIN_LIBS)/sdk/lib/um/x86_64/shell32.lib
 LIB_SQLITE     = $(ABS_SQLITE)/sqlite3.lib
 
+linux-debug: $(BUILD_DIR)
+	$(ODIN) build $(ODIN_SRC) -build-mode:shared -debug -o:none -out:$(BUILD_DIR)/plsqlite.so
+
 debug: $(BUILD_DIR)
 	$(ODIN) build $(ODIN_SRC) -build-mode:shared -out:$(BUILD_DIR)/plsqlite.so -debug
 
-test: linux
-	PLSQL_DEBUG=1 python3 -m unittest tests.test_plsqlite -v
+test: linux-debug
+	python3 tests/test_plsqlite.py
 
 # Valgrind leak check (requires C runner)
-leak-check: linux
-	$(CC) $(CFLAGS) tests/leak_check.c -o $(BUILD_DIR)/leak_check -lsqlite3 -I.
+leak-check: linux-debug
+	# Build the leak check binary
+	gcc -g tests/leak_check.c -o $(BUILD_DIR)/leak_check -lsqlite3 -I.
 	# Run Valgrind with our test runner
 	# Note: We expect some leaks from SQLite itself (suppressed usually),
 	# but we want to see if our Odin runtime leaks Scope/Statements.
+	PLSQL_DEBUG=1 \
 	valgrind --leak-check=full \
 		--show-leak-kinds=all \
 		--error-exitcode=1 \
