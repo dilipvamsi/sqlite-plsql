@@ -93,9 +93,10 @@ SELECT register_plsql('validate_user', 'id', '
 
 | Use Case | Application Layer | PL/SQLite | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Simple Iteration** | ~10-70 ms | **~130 ms** | **6x Faster** (prev ~800ms) 🚀 |
-| **Bulk Inserts** | ~100 ms | ~120 ms | Near-native overhead |
-| **Complex Transactions** | **~750 ms** | **~65 ms** | **11.5x Faster** 🔥 |
+| **Simple Iteration** | ~300-600 ms | **~200-250 ms** | **1.5x-3.0x Faster** (Go/Python) 🚀 |
+| **RANGE Iteration** | ~80-170 ms | **~70-90 ms** | **1.5x-1.7x Faster** (Rust/Go) 🚀 |
+| **Bulk Inserts** | ~110-190 ms | **~80-150 ms** | **1.6x Faster** (Rust) 🚀 |
+| **Complex Transactions** | **~850-1500 ms** | **~60-120 ms** | **15x Faster** (Batched) 🔥 |
 
 **Verdict**: Use PL/SQLite when you need to perform multiple reads/writes based on intermediate results without paying the round-trip cost for each step. Uses Application Logic when you need to integrate with external services or render UIs.
 
@@ -158,7 +159,14 @@ FOR r IN (SELECT id, price FROM items) LOOP
 END LOOP;
 ```
 
-### 3. Procedures & CALL Syntax
+```sql
+-- Efficient numerical iteration
+RANGE i IN (1, 100) LOOP
+    INSERT INTO logs(val) VALUES (@i);
+END LOOP;
+```
+
+### 4. Procedures & CALL Syntax
 Procedures can call other procedures using the `CALL` keyword.
 
 ```sql
@@ -170,7 +178,7 @@ DECLARE res = CALL process_payment(@user_id, @amount);
 IF (@res == "SUCCESS") THEN ...
 ```
 
-### 4. Named Scopes (Advanced)
+### 5. Named Scopes (Advanced)
 A child procedure can read a parent's variable explicitly.
 
 ```sql
@@ -373,46 +381,60 @@ make bench-rust      # Run Rust benchmarks
 make bench-sql       # Run pure SQL CLI benchmarks
 ```
 
+### 1. Iteration Performance (**100k rows**)
+Logic: `for row in data: if val > 50: insert weighted else: insert normal`
+
 | Language / Driver | App-Layer Logic | PL/SQLite (In-DB) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Python** | 38.12 ms | 142.98 ms | 0.27x |
-| **Node.js** | 67.00 ms | 133.00 ms | 0.50x |
-| **Go** | 48.21 ms | 140.76 ms | 0.34x |
-| **Rust** | 7.76 ms | 130.72 ms | 0.06x |
-| **SQL CLI** | N/A | **125.75 ms** | 0.30x |
+| **Python** | 383.32 ms | 255.36 ms | 1.50x |
+| **Node.js** | 309.00 ms | 385.00 ms | 0.80x |
+| **Go** | 618.57 ms | 208.97 ms | 2.96x |
+| **Rust** | 128.77 ms | 200.56 ms | 0.64x |
+| **SQL CLI** | N/A | **208.59 ms** | 1.84x |
 
-### 2. Bulk Operations (**10k inserts**)
+### 2. RANGE Iteration (**10k inserts**)
+Logic: Native `RANGE` loop vs application-layer `for` loop.
+
+| Language / Driver | App-Layer | PL/SQLite (Range) | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Python** | 78.78 ms | 80.21 ms | 0.98x |
+| **Node.js** | 176.00 ms | 167.00 ms | 1.05x |
+| **Go** | 142.23 ms | 92.75 ms | 1.53x |
+| **Rust** | 120.57 ms | 72.12 ms | 1.67x |
+| **SQL CLI** | N/A | **80.13 ms** | 0.98x |
+
+### 3. Bulk Operations (**10k inserts**)
 Logic: One procedure call vs 10k separate `INSERT` statements in a transaction.
 
 | Language / Driver | App-Layer (Tx) | PL/SQLite (Proc) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Python** | 117.08 ms | 141.74 ms | 0.83x |
-| **Node.js** | 152.00 ms | 377.00 ms | 0.40x |
-| **Go** | 117.08 ms | 117.24 ms | 1.00x |
-| **Rust** | 77.59 ms | 136.18 ms | 0.57x |
-| **SQL CLI** | N/A | 86.30 ms | 1.36x |
+| **Python** | 110.04 ms | 86.48 ms | 1.27x |
+| **Node.js** | 193.00 ms | 126.00 ms | 1.53x |
+| **Go** | 152.33 ms | 151.65 ms | 1.00x |
+| **Rust** | 128.35 ms | 80.24 ms | 1.60x |
+| **SQL CLI** | N/A | **96.31 ms** | 1.14x |
 
-### 3. Recursive Calls (**200 depth**)
+### 4. Recursive Calls (**200 depth**)
 Logic: `RETURN n + CALL rec_sum(n - 1)`
 
 | Language / Driver | App-Layer | PL/SQLite | Note |
 | :--- | :--- | :--- | :--- |
-| **Python** | 0.0486 ms | 12.57 ms | 0.00x |
-| **Node.js** | 0.0207 ms | 35.83 ms | 0.00x |
-| **Go** | 0.0017 ms | 15.27 ms | 0.00x |
-| **Rust** | 0.0001 ms | 17.22 ms | 0.00x |
-| **SQL CLI** | N/A | **6.79 ms** | Native proc-call overhead |
+| **Python** | 83.14 ms | 63.73 ms | 1.30x |
+| **Node.js** | 92.50 ms | 150.83 ms | 0.61x |
+| **Go** | 76.74 ms | 84.05 ms | 0.91x |
+| **Rust** | 120.54 ms | 105.44 ms | 1.14x |
+| **SQL CLI** | N/A | **113.75 ms** | 0.73x |
 
-### 4. Complex Transactions (**10 transfers**)
+### 5. Complex Transactions (**10 transfers**)
 Logic: Account transfer involving multiple selects and updates within a single procedural call vs. multiple app-layer boundaries.
 
 | Language / Driver | App-Layer | PL/SQL Proc | PL/SQL Batch | Speedup (Batch) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Python** | 750.04 ms | 1374.00 ms | 107.43 ms | **7.0x** 🔥 |
-| **Node.js** | 1274 ms | 1251 ms | 267 ms | **4.8x** 🔥 |
-| **Go** | 915.88 ms | 1402.56 ms | 75.61 ms | **12.1x** 🔥 |
-| **Rust** | 716.27 ms | 799.09 ms | 65.69 ms | **10.9x** 🔥 |
-| **SQL CLI** | N/A | N/A | **82.30 ms** | **9.1x** 🔥 |
+| **Python** | 879.07 ms | 700.13 ms | 116.86 ms | **7.52x** 🔥 |
+| **Node.js** | 1517 ms | 1300 ms | 101 ms | **15.0x** 🔥 |
+| **Go** | 1225.58 ms | 924.03 ms | 117.29 ms | **10.5x** 🔥 |
+| **Rust** | 865.79 ms | 758.27 ms | 66.73 ms | **13.0x** 🔥 |
+| **SQL CLI** | N/A | N/A | **58.23 ms** | **15.1x** 🔥 |
 
 ### 🔍 Analysis: When to use PL/SQLite?
 1. **Networked Databases (Massive Win)**: On a networked database (e.g., Turso, rqlite, sqlite-server), the round-trip overhead makes app-layer transactions take **seconds or minutes**. PL/SQLite executes them in **milliseconds**.

@@ -2,19 +2,18 @@ import sqlite3
 import time
 import os
 import sys
-
-# Path to the extension
-EXT_PATH = os.path.abspath("../../build/plsqlite.so")
-DB_PATH = "../../databases/bench.db"
+from bench_utils import get_connection, load_plsqlite
 
 def setup_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.execute("DROP TABLE IF EXISTS bulk_data;")
     conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);")
     conn.close()
 
 def bench_app_layer(n=10000):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
+    conn.execute("DROP TABLE IF EXISTS bulk_data;")
+    conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);")
     start = time.time()
 
     # Python app logic: multiple inserts in one transaction
@@ -28,15 +27,16 @@ def bench_app_layer(n=10000):
     return (end - start) * 1000
 
 def bench_plsqlite(n=10000):
-    conn = sqlite3.connect(DB_PATH)
-    conn.enable_load_extension(True)
-    conn.load_extension(EXT_PATH)
+    conn = get_connection()
+    conn.execute("DROP TABLE IF EXISTS bulk_data;")
+    conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);")
+    load_plsqlite(conn)
 
     conn.execute("""
     SELECT register_plsql('bulk_insert', 'n', '
         DECLARE i = 0;
-        FOR r IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-            INSERT INTO bulk_data (val) VALUES (''row_'' || @r.x);
+        RANGE i IN (1, @n) LOOP
+            INSERT INTO bulk_data (val) VALUES (''row_'' || @i);
         END LOOP;
         RETURN ''DONE'';
     ');
@@ -59,4 +59,5 @@ if __name__ == "__main__":
     pl_time = bench_plsqlite()
     print(f"RESULT: Bulk: PL/SQLite: {pl_time:.2f}ms")
 
-    print(f"Speedup: {app_time/pl_time:.2f}x")
+    if pl_time > 0:
+        print(f"Speedup: {app_time/pl_time:.2f}x")

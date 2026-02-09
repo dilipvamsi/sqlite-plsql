@@ -1,18 +1,16 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-
-const dbPath = path.resolve(__dirname, '../../databases/bench.db');
-const extPath = path.resolve(__dirname, '../../build/plsqlite.so');
+const { getDbConnection, loadPLSQLite } = require('./bench_utils');
 
 function setupDb() {
-    const db = new Database(dbPath);
+    const db = getDbConnection();
     db.exec("DROP TABLE IF EXISTS bulk_data;");
     db.exec("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);");
     db.close();
 }
 
 function benchAppLayer(n = 10000) {
-    const db = new Database(dbPath);
+    const db = getDbConnection();
+    db.exec("DROP TABLE IF EXISTS bulk_data;");
+    db.exec("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);");
     const start = Date.now();
 
     const insert = db.prepare("INSERT INTO bulk_data (val) VALUES (?)");
@@ -31,14 +29,16 @@ function benchAppLayer(n = 10000) {
 }
 
 function benchPLSQLite(n = 10000) {
-    const db = new Database(dbPath);
-    db.loadExtension(extPath);
+    const db = getDbConnection();
+    db.exec("DROP TABLE IF EXISTS bulk_data;");
+    db.exec("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);");
+    loadPLSQLite(db);
 
     db.prepare(`
         SELECT register_plsql('bulk_insert', 'n', '
             DECLARE i = 0;
-            FOR r IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-                INSERT INTO bulk_data (val) VALUES (''row_'' || @r.x);
+            RANGE i IN (1, @n) LOOP
+                INSERT INTO bulk_data (val) VALUES (''row_'' || @i);
             END LOOP;
             RETURN ''DONE'';
         ');
@@ -61,4 +61,6 @@ setupDb();
 const plTime = benchPLSQLite();
 console.log(`RESULT: Bulk: PL/SQLite: ${plTime.toFixed(2)}ms`);
 
-console.log(`Speedup: ${(appTime / plTime).toFixed(2)}x`);
+if (plTime > 0) {
+    console.log(`Speedup: ${(appTime / plTime).toFixed(2)}x`);
+}

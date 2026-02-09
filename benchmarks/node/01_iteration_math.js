@@ -1,62 +1,57 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
-
-const dbPath = path.resolve(__dirname, '../../databases/bench.db');
-let extPath = '';
-
-if (process.platform === 'win32') {
-    extPath = path.resolve(__dirname, '../../build/plsqlite.dll');
-} else if (process.platform === 'darwin') {
-    extPath = path.resolve(__dirname, '../../build/plsqlite.dylib');
-} else {
-    extPath = path.resolve(__dirname, '../../build/plsqlite.so');
-}
+const { getDbConnection, loadPLSQLite } = require('./bench_utils');
 
 function benchAppLayer() {
-    const db = new Database(dbPath);
+    const db = getDbConnection();
+    db.prepare("DROP TABLE IF EXISTS iteration_results").run();
+    db.prepare("CREATE TABLE iteration_results(val REAL)").run();
     const start = Date.now();
 
-    let sum = 0.0;
     const stmt = db.prepare('SELECT val FROM data');
-    for (const row of stmt.iterate()) {
-        const val = row.val;
-        if (val > 50) {
-            sum += val * 1.5;
-        } else {
-            sum += val;
+    const rows = stmt.all();
+    const insertMany = db.transaction((rows) => {
+        const insertStmt = db.prepare('INSERT INTO iteration_results(val) VALUES (?)');
+        for (const row of rows) {
+            const val = row.val;
+            if (val > 50) {
+                insertStmt.run(val * 1.5);
+            } else {
+                insertStmt.run(val);
+            }
         }
-    }
+    });
+
+    insertMany(rows);
 
     const end = Date.now();
+    const count = db.prepare("SELECT count(*) as c FROM iteration_results").get().c;
     db.close();
-    return { time: end - start, sum };
+    return { time: end - start, sum: count };
 }
 
 function benchPLSQLite() {
-    const db = new Database(dbPath);
-    // better-sqlite3 loads extensions via .loadExtension()
-    db.loadExtension(extPath);
+    const db = getDbConnection();
+    loadPLSQLite(db);
+    db.prepare("DROP TABLE IF EXISTS iteration_results").run();
+    db.prepare("CREATE TABLE iteration_results(val REAL)").run();
 
     db.prepare(`
-        SELECT register_plsql('weighted_sum', '', '
-            DECLARE total = 0.0;
+        SELECT register_plsql('weighted_sum_insert', '', '
             FOR r IN (SELECT val FROM data) LOOP
                 IF (@r.val > 50) THEN
-                    SET total = @total + (@r.val * 1.5);
+                    INSERT INTO iteration_results(val) VALUES (@r.val * 1.5);
                 ELSE
-                    SET total = @total + @r.val;
+                    INSERT INTO iteration_results(val) VALUES (@r.val);
                 END IF;
             END LOOP;
-            RETURN @total;
         ');
     `).run();
 
     const start = Date.now();
-    const sum = db.prepare("SELECT run_plsql('weighted_sum') as res").get().res;
+    db.prepare("SELECT run_plsql('weighted_sum_insert')").run();
     const end = Date.now();
+    const count = db.prepare("SELECT count(*) as c FROM iteration_results").get().c;
     db.close();
-    return { time: end - start, sum };
+    return { time: end - start, sum: count };
 }
 
 console.log("--- Node.js Benchmarks (better-sqlite3) ---");
@@ -66,4 +61,6 @@ console.log(`RESULT: Iteration: App-Layer: ${app.time.toFixed(2)}ms (Result: ${a
 const pl = benchPLSQLite();
 console.log(`RESULT: Iteration: PL/SQLite: ${pl.time.toFixed(2)}ms (Result: ${pl.sum})`);
 
-console.log(`Speedup: ${(app.time / pl.time).toFixed(2)}x`);
+if (pl.time > 0) {
+    console.log(`Speedup: ${(app.time / pl.time).toFixed(2)}x`);
+}

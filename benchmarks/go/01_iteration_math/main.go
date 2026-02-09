@@ -1,34 +1,22 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
-	"path/filepath"
-	"runtime"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
+	"benchmarks/go/utils"
 )
 
-func getExtPath() string {
-	abs, _ := filepath.Abs("../../build")
-	if runtime.GOOS == "windows" {
-		return filepath.Join(abs, "plsqlite.dll")
-	} else if runtime.GOOS == "darwin" {
-		return filepath.Join(abs, "plsqlite.dylib")
-	}
-	return filepath.Join(abs, "plsqlite.so")
-}
-
-const dbPath = "../../databases/bench.db"
-
-func benchAppLayer() (float64, float64) {
-	db, err := sql.Open("sqlite3", dbPath)
+func benchAppLayer() (float64, int) {
+	db, err := utils.GetConnection(false)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	db.Exec("DROP TABLE IF EXISTS iteration_results")
+	db.Exec("CREATE TABLE iteration_results(val REAL)")
 
 	start := time.Now()
 	rows, err := db.Query("SELECT val FROM data")
@@ -37,44 +25,49 @@ func benchAppLayer() (float64, float64) {
 	}
 	defer rows.Close()
 
-	var sum float64
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stmt, _ := tx.Prepare("INSERT INTO iteration_results(val) VALUES (?)")
+	defer stmt.Close()
+
 	for rows.Next() {
 		var val float64
 		rows.Scan(&val)
 		if val > 50 {
-			sum += val * 1.5
+			stmt.Exec(val * 1.5)
 		} else {
-			sum += val
+			stmt.Exec(val)
 		}
 	}
+	tx.Commit()
 
 	elapsed := time.Since(start).Seconds() * 1000
-	return elapsed, sum
+	var count int
+	db.QueryRow("SELECT count(*) FROM iteration_results").Scan(&count)
+	return elapsed, count
 }
 
-func benchPLSQLite() (float64, float64) {
-	driverName := fmt.Sprintf("sqlite3_with_ext_%d", time.Now().UnixNano())
-	sql.Register(driverName, &sqlite3.SQLiteDriver{
-		Extensions: []string{getExtPath()},
-	})
-
-	db, err := sql.Open(driverName, dbPath)
+func benchPLSQLite() (float64, int) {
+	db, err := utils.GetConnection(true)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
+	db.Exec("DROP TABLE IF EXISTS iteration_results")
+	db.Exec("CREATE TABLE iteration_results(val REAL)")
+
 	_, err = db.Exec(`
-        SELECT register_plsql('weighted_sum', '', '
-            DECLARE total = 0.0;
+        SELECT register_plsql('weighted_sum_insert', '', '
             FOR r IN (SELECT val FROM data) LOOP
                 IF (@r.val > 50) THEN
-                    SET total = @total + (@r.val * 1.5);
+                    INSERT INTO iteration_results(val) VALUES (@r.val * 1.5);
                 ELSE
-                    SET total = @total + @r.val;
+                    INSERT INTO iteration_results(val) VALUES (@r.val);
                 END IF;
             END LOOP;
-            RETURN @total;
         ');
     `)
 	if err != nil {
@@ -82,23 +75,27 @@ func benchPLSQLite() (float64, float64) {
 	}
 
 	start := time.Now()
-	var sum float64
-	err = db.QueryRow("SELECT run_plsql('weighted_sum')").Scan(&sum)
+	_, err = db.Exec("SELECT run_plsql('weighted_sum_insert')")
 	if err != nil {
 		log.Fatal("Run fail:", err)
 	}
 	elapsed := time.Since(start).Seconds() * 1000
-	return elapsed, sum
+
+	var count int
+	db.QueryRow("SELECT count(*) FROM iteration_results").Scan(&count)
+	return elapsed, count
 }
 
 func main() {
-	fmt.Println("--- Go Benchmarks ---")
+	fmt.Println("--- Go Iteration Benchmarks ---")
 
-	appTime, appSum := benchAppLayer()
-	fmt.Printf("RESULT: Iteration: App-Layer: %.2fms (Result: %.2f)\n", appTime, appSum)
+	appTime, appCount := benchAppLayer()
+	fmt.Printf("RESULT: Iteration: App-Layer: %.2fms (Result: %d)\n", appTime, appCount)
 
-	plTime, plSum := benchPLSQLite()
-	fmt.Printf("RESULT: Iteration: PL/SQLite: %.2fms (Result: %.2f)\n", plTime, plSum)
+	plTime, plCount := benchPLSQLite()
+	fmt.Printf("RESULT: Iteration: PL/SQLite: %.2fms (Result: %d)\n", plTime, plCount)
 
-	fmt.Printf("Speedup: %.2fx\n", appTime/plTime)
+	if plTime > 0 {
+		fmt.Printf("Speedup: %.2fx\n", appTime/plTime)
+	}
 }

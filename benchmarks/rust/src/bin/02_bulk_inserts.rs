@@ -1,18 +1,19 @@
-use rusqlite::{Connection, Result};
+use rust_benchmarks::get_db_connection;
+use rusqlite::Result;
 use std::time::Instant;
 
-const DB_PATH: &str = "../../databases/bench.db";
-const EXT_PATH: &str = "../../build/plsqlite.so";
-
 fn setup_db() -> Result<()> {
-    let conn = Connection::open(DB_PATH)?;
+    let conn = get_db_connection(false)?;
     conn.execute("DROP TABLE IF EXISTS bulk_data;", [])?;
     conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);", [])?;
     Ok(())
 }
 
 fn bench_app_layer(n: i32) -> Result<f64> {
-    let mut conn = Connection::open(DB_PATH)?;
+    let mut conn = get_db_connection(false)?;
+    conn.execute("DROP TABLE IF EXISTS bulk_data;", [])?;
+    conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);", [])?;
+    
     let start = Instant::now();
 
     let tx = conn.transaction()?;
@@ -28,31 +29,24 @@ fn bench_app_layer(n: i32) -> Result<f64> {
     Ok(elapsed)
 }
 
-extern "C" {
-    fn sqlite3_enable_load_extension(db: *mut std::ffi::c_void, onoff: i32) -> i32;
-}
-
 fn bench_plsqlite(n: i32) -> Result<f64> {
-    let conn = Connection::open(DB_PATH)?;
-    unsafe {
-        let handle = conn.handle();
-        sqlite3_enable_load_extension(handle as _, 1);
-        conn.load_extension(EXT_PATH, None)?;
-    }
-
-    let _: String = conn.query_row(
+    let conn = get_db_connection(true)?;
+    conn.execute("DROP TABLE IF EXISTS bulk_data;", [])?;
+    conn.execute("CREATE TABLE bulk_data (id INTEGER PRIMARY KEY, val TEXT);", [])?;
+    
+    conn.query_row(
         "SELECT register_plsql('bulk_insert', 'n', '
-            FOR r IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-                INSERT INTO bulk_data (val) VALUES (''row_'' || @r.x);
+            RANGE i IN (1, @n) LOOP
+                INSERT INTO bulk_data (val) VALUES (''row_'' || @i);
             END LOOP;
             RETURN ''DONE'';
         ');",
         [],
-        |r| r.get(0)
+        |_| Ok(())
     )?;
 
     let start = Instant::now();
-    let _: String = conn.query_row("SELECT run_plsql('bulk_insert', ?)", [n], |r| r.get(0))?;
+    conn.query_row("SELECT run_plsql('bulk_insert', ?)", [n], |_| Ok(()))?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(elapsed)
@@ -70,7 +64,9 @@ fn main() -> Result<()> {
     let pl_time = bench_plsqlite(n)?;
     println!("RESULT: Bulk: PL/SQLite: {:.2}ms", pl_time);
 
-    println!("Speedup: {:.2}x", app_time / pl_time);
+    if pl_time > 0.0 {
+        println!("Speedup: {:.2}x", app_time / pl_time);
+    }
 
     Ok(())
 }

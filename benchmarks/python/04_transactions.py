@@ -2,23 +2,21 @@ import sqlite3
 import time
 import os
 import sys
+from bench_utils import get_connection, load_plsqlite
 
-# Path to the extension
-if os.name == 'nt':
-    EXT_PATH = os.path.abspath("../../build/plsqlite.dll")
-else:
-    EXT_PATH = os.path.abspath("../../build/plsqlite.so")
-
-DB_PATH = "../../databases/bench.db"
-
-def setup_accounts():
-    conn = sqlite3.connect(DB_PATH)
+def setup_accounts(conn=None):
+    close = False
+    if conn is None:
+        conn = get_connection()
+        close = True
     conn.execute("UPDATE accounts SET balance = 1000.0")
     conn.commit()
-    conn.close()
+    if close:
+        conn.close()
 
 def bench_app_layer(n=1000):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
+    setup_accounts(conn)
     start = time.time()
 
     for i in range(1, n + 1):
@@ -38,9 +36,9 @@ def bench_app_layer(n=1000):
     return (end - start) * 1000
 
 def bench_plsqlite(n=1000):
-    conn = sqlite3.connect(DB_PATH)
-    conn.enable_load_extension(True)
-    conn.load_extension(EXT_PATH)
+    conn = get_connection()
+    setup_accounts(conn)
+    load_plsqlite(conn)
 
     conn.execute("""
     SELECT register_plsql('transfer', 'from_id, to_id, amount', '
@@ -63,19 +61,30 @@ def bench_plsqlite(n=1000):
     return (end - start) * 1000
 
 def bench_plsqlite_batched(n=1000):
-    conn = sqlite3.connect(DB_PATH)
-    conn.enable_load_extension(True)
-    conn.load_extension(EXT_PATH)
+    conn = get_connection()
+    setup_accounts(conn)
+    load_plsqlite(conn)
+
+    conn.execute("""
+    SELECT register_plsql('transfer', 'from_id, to_id, amount', '
+        DECLARE bal = 0.0;
+        SET bal = (SELECT balance FROM accounts WHERE id = @from_id);
+        IF (@bal >= @amount) THEN
+            UPDATE accounts SET balance = balance - @amount WHERE id = @from_id;
+            UPDATE accounts SET balance = balance + @amount WHERE id = @to_id;
+        END IF;
+        RETURN @bal;
+    ');
+    """)
 
     conn.execute("""
     SELECT register_plsql('batch_transfer', 'n', '
-        FOR i IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-            CALL transfer(@i.x, @i.x + 1, 10.0);
+        RANGE i IN (1, @n) LOOP
+            CALL transfer(@i, @i + 1, 10.0);
         END LOOP;
         RETURN "DONE";
     ');
     """)
-
     start = time.time()
     conn.execute("SELECT run_plsql('batch_transfer', ?)", (n,))
     end = time.time()
@@ -98,5 +107,7 @@ if __name__ == "__main__":
     pl_batch_time = bench_plsqlite_batched(n)
     print(f"RESULT: Transactions: PL/SQLite Batch: {pl_batch_time:.2f}ms")
 
-    print(f"Speedup (App vs Proc): {app_time/pl_time:.2f}x")
-    print(f"Speedup (App vs Batch): {app_time/pl_batch_time:.2f}x")
+    if pl_time > 0:
+        print(f"Speedup (App vs Proc): {app_time/pl_time:.2f}x")
+    if pl_batch_time > 0:
+        print(f"Speedup (App vs Batch): {app_time/pl_batch_time:.2f}x")

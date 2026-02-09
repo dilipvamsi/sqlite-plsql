@@ -1,5 +1,4 @@
--- Case 4: Complex Transactional Logic (Account Transfers)
-.load build/plsqlite
+-- Case 4: Complex Transaction Logic (10 transfers)
 
 SELECT register_plsql('transfer', 'from_id, to_id, amount', '
     DECLARE bal = 0.0;
@@ -12,8 +11,8 @@ SELECT register_plsql('transfer', 'from_id, to_id, amount', '
 ');
 
 SELECT register_plsql('batch_transfer', 'n', '
-    FOR i IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-        CALL transfer(@i.x, @i.x + 1, 10.0);
+    RANGE i IN (1, @n) LOOP
+        CALL transfer(@i, @i + 1, 10.0);
     END LOOP;
     RETURN ''DONE'';
 ');

@@ -65,7 +65,8 @@ def parse_results(output):
                     if "Iteration" in target_case: target_case = "Iteration"
                     elif "Bulk" in target_case: target_case = "Bulk"
                     elif "Recursion" in target_case: target_case = "Recursion"
-                    elif "Transaction" in target_case: target_case = "Transactions"
+                    elif "Transactions" in target_case or "Transaction" in target_case: target_case = "Transactions"
+                    elif "RANGE" in target_case or "Range" in target_case: target_case = "Range"
 
                     if DEBUG: print(f"DEBUG: SQL Match - Case: {target_case}, Val: {val}ms (from {seconds}s)")
 
@@ -88,7 +89,8 @@ def parse_results(output):
             if "Iteration" in case_name: target_case = "Iteration"
             elif "Bulk" in case_name: target_case = "Bulk"
             elif "Recursion" in case_name: target_case = "Recursion"
-            elif "Transaction" in case_name: target_case = "Transactions"
+            elif "Transactions" in case_name or "Transaction" in case_name: target_case = "Transactions"
+            elif "Range" in case_name: target_case = "Range"
 
             if DEBUG: print(f"DEBUG: Match - Case: {target_case}, Key: {key}, Val: {val}")
 
@@ -102,7 +104,7 @@ def parse_results(output):
     return data
 
 def print_report(data):
-    use_cases = ["Iteration", "Bulk", "Recursion", "Transactions"]
+    use_cases = ["Iteration", "Range", "Bulk", "Recursion", "Transactions"]
     langs = ["Python", "Node.js", "Go", "Rust", "SQL CLI"]
 
     for case in use_cases:
@@ -152,7 +154,13 @@ def print_report(data):
 
 if __name__ == "__main__":
     tx_count = os.getenv("BENCH_TX_COUNT", "10")
-    print(f"Collecting benchmarks (Transactions: {tx_count})...")
+    use_mem = os.getenv("BENCH_USE_MEMORY", "0") in ("1", "true", "TRUE")
+    mode_str = "IN-MEMORY" if use_mem else "FILE-BASED"
+
+    print(f"============================================================")
+    print(f" DATABASE MODE: {mode_str}")
+    print(f" Collecting benchmarks (Transactions: {tx_count})...")
+    print(f"============================================================")
 
     full_output = ""
     for target in ["python", "node", "go", "rust", "sql"]:

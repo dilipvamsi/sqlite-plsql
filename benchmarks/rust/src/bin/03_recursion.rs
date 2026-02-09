@@ -1,64 +1,69 @@
-use rusqlite::{Connection, Result};
+use rust_benchmarks::get_db_connection;
+use rusqlite::{params, Result};
 use std::time::Instant;
-use std::ffi::c_void;
 
-const DB_PATH: &str = "../../databases/bench.db";
-const EXT_PATH: &str = "../../build/plsqlite.so";
+fn bench_app_layer(depth: i32) -> Result<(f64, i64)> {
+    let mut conn = get_db_connection(false)?;
+    conn.execute("DROP TABLE IF EXISTS recursion_log", [])?;
+    conn.execute("CREATE TABLE recursion_log(depth INTEGER, val INTEGER)", [])?;
 
-extern "C" {
-    fn sqlite3_enable_load_extension(db: *mut c_void, onoff: i32) -> i32;
-}
-
-fn recurse(n: i32) -> i32 {
-    if n <= 0 { 0 } else { n + recurse(n - 1) }
-}
-
-fn bench_app_layer(depth: i32) -> f64 {
+    let tx = conn.transaction()?;
     let start = Instant::now();
-    let _res = recurse(depth);
-    start.elapsed().as_secs_f64() * 1000.0
+    {
+        let mut stmt = tx.prepare("INSERT INTO recursion_log(depth, val) VALUES (?, ?)")?;
+        fn recurse(n: i32, stmt: &mut rusqlite::Statement) -> i32 {
+            if n <= 0 {
+                return 0;
+            }
+            stmt.execute(params![n, n * 2]).unwrap();
+            n + recurse(n - 1, stmt)
+        }
+        recurse(depth, &mut stmt);
+    }
+    tx.commit()?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let count: i64 = conn.query_row("SELECT count(*) FROM recursion_log", [], |r| r.get(0))?;
+    Ok((elapsed, count))
 }
 
-fn bench_plsqlite(depth: i32) -> Result<f64> {
-    let conn = Connection::open(DB_PATH)?;
-    unsafe {
-        let handle = conn.handle();
-        sqlite3_enable_load_extension(handle as _, 1);
-        conn.load_extension(EXT_PATH, None)?;
-    }
+fn bench_plsqlite(depth: i32) -> Result<(f64, i64)> {
+    let conn = get_db_connection(true)?;
 
-    let _: String = conn.query_row(
-        "SELECT register_plsql('rec_sum', 'n', '
+    conn.execute("DROP TABLE IF EXISTS recursion_log", [])?;
+    conn.execute("CREATE TABLE recursion_log(depth INTEGER, val INTEGER)", [])?;
+
+    conn.query_row(
+        "SELECT register_plsql('rec_log_insert', 'n', '
             IF (@n <= 0) THEN
                 RETURN 0;
-            ELSE
-                DECLARE inner_res = 0;
-                SET inner_res = (SELECT run_plsql(''rec_sum'', @n - 1));
-                RETURN @n + @inner_res;
             END IF;
+            INSERT INTO recursion_log(depth, val) VALUES (@n, @n * 2);
+            RETURN @n + (SELECT run_plsql(''rec_log_insert'', @n - 1));
         ');",
         [],
-        |r| r.get(0)
+        |_| Ok(())
     )?;
 
     let start = Instant::now();
-    let _res: i32 = conn.query_row("SELECT run_plsql('rec_sum', ?)", [depth], |r| r.get(0))?;
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
+    conn.query_row("SELECT run_plsql('rec_log_insert', ?)", params![depth], |_| Ok(()))?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let count: i64 = conn.query_row("SELECT count(*) FROM recursion_log", [], |r| r.get(0))?;
+    Ok((elapsed, count))
 }
 
 fn main() -> Result<()> {
-    println!("--- Rust Recursion Benchmarks ---");
-    let depth = 200;
+    let depth = 100;
+    println!("--- Rust Recursion (depth {}) ---", depth);
 
-    let app_time = bench_app_layer(depth);
-    println!("RESULT: Recursion: App-Layer: {:.4}ms", app_time);
+    let (app_time, app_res) = bench_app_layer(depth)?;
+    println!("RESULT: Recursion: App-Layer: {:.4}ms (Result: {})", app_time, app_res);
 
-    let pl_time = bench_plsqlite(depth)?;
-    println!("RESULT: Recursion: PL/SQLite Proc: {:.2}ms", pl_time);
+    let (pl_time, pl_res) = bench_plsqlite(depth)?;
+    println!("RESULT: Recursion: PL/SQLite Proc: {:.2}ms (Result: {})", pl_time, pl_res);
 
     if pl_time > 0.0 {
         println!("Speedup: {:.4}x", app_time / pl_time);
     }
-
     Ok(())
 }

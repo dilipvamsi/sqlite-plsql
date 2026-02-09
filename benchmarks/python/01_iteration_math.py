@@ -2,56 +2,49 @@ import sqlite3
 import time
 import os
 import sys
-
-# Path to the extension
-if os.name == 'nt':
-    EXT_PATH = os.path.abspath("build/plsqlite.dll")
-elif sys.platform == 'darwin':
-    EXT_PATH = os.path.abspath("build/plsqlite.dylib")
-else:
-    EXT_PATH = os.path.abspath("../../build/plsqlite.so")
-
-DB_PATH = "../../databases/bench.db"
+from bench_utils import get_connection, load_plsqlite
 
 def bench_app_layer():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
+    conn.execute("DROP TABLE IF EXISTS iteration_results")
+    conn.execute("CREATE TABLE iteration_results(val REAL)")
     start = time.time()
-
-    sum_val = 0.0
-    for row in conn.execute("SELECT val FROM data"):
-        val = row[0]
-        if val > 50:
-            sum_val += val * 1.5
-        else:
-            sum_val += val
-
+    with conn:
+        for row in conn.execute("SELECT val FROM data"):
+            val = row[0]
+            if val > 50:
+                conn.execute("INSERT INTO iteration_results(val) VALUES (?)", (val * 1.5,))
+            else:
+                conn.execute("INSERT INTO iteration_results(val) VALUES (?)", (val,))
     end = time.time()
+    res = conn.execute("SELECT count(*) FROM iteration_results").fetchone()[0]
     conn.close()
-    return (end - start) * 1000, sum_val
+    return (end - start) * 1000, res
 
 def bench_plsqlite():
-    conn = sqlite3.connect(DB_PATH)
-    conn.enable_load_extension(True)
-    conn.load_extension(EXT_PATH)
+    conn = get_connection()
+    load_plsqlite(conn)
+    conn.execute("DROP TABLE IF EXISTS iteration_results")
+    conn.execute("CREATE TABLE iteration_results(val REAL)")
+
     conn.execute("""
-    SELECT register_plsql('weighted_sum', '', '
-        DECLARE total = 0.0;
+    SELECT register_plsql('weighted_sum_insert', '', '
         FOR r IN (SELECT val FROM data) LOOP
             IF (@r.val > 50) THEN
-                SET total = @total + (@r.val * 1.5);
+                INSERT INTO iteration_results(val) VALUES (@r.val * 1.5);
             ELSE
-                SET total = @total + @r.val;
+                INSERT INTO iteration_results(val) VALUES (@r.val);
             END IF;
         END LOOP;
-        RETURN @total;
     ');
     """)
 
     start = time.time()
-    result = conn.execute("SELECT run_plsql('weighted_sum');").fetchone()[0]
+    conn.execute("SELECT run_plsql('weighted_sum_insert');").fetchone()
     end = time.time()
+    res = conn.execute("SELECT count(*) FROM iteration_results").fetchone()[0]
     conn.close()
-    return (end - start) * 1000, result
+    return (end - start) * 1000, res
 
 if __name__ == "__main__":
     print("--- Python Benchmarks ---")
@@ -61,4 +54,5 @@ if __name__ == "__main__":
     pl_time, pl_res = bench_plsqlite()
     print(f"RESULT: Iteration: PL/SQLite: {pl_time:.2f}ms (Result: {pl_res})")
 
-    print(f"Speedup: {app_time/pl_time:.2f}x")
+    if pl_time > 0:
+        print(f"Speedup: {app_time/pl_time:.2f}x")

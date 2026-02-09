@@ -4,42 +4,56 @@ import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:strings"
 
-// Global tracking allocator
-track: mem.Tracking_Allocator
-track_initialized: bool
+// Global context definition
+tracking_allocator: mem.Tracking_Allocator
+tracking_allocator_initialized: bool = false
 
-// plsqlite_context returns a context that uses the tracking allocator.
-// It initializes the allocator on the first call.
 plsqlite_context :: proc() -> runtime.Context {
-	if !track_initialized {
-		mem.tracking_allocator_init(&track, runtime.default_allocator())
-		track_initialized = true
+	ctx := runtime.default_context()
+
+	if DEBUG_ENABLED {
+		if !tracking_allocator_initialized {
+			mem.tracking_allocator_init(&tracking_allocator, runtime.default_allocator())
+			tracking_allocator_initialized = true
+		}
+		ctx.allocator = mem.tracking_allocator(&tracking_allocator)
 	}
 
-	ctx := runtime.default_context()
-	ctx.allocator = mem.tracking_allocator(&track)
 	return ctx
 }
 
-// plsql_leak_report is an SQL function that prints the current memory usage and leaks.
-// Usage: SELECT plsql_leak_report();
-plsql_leak_report :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
+// __plsql_leak_report reports SQLite memory usage stats.
+// Note: PL/SQL runtime memory usage is not tracked here when using the default allocator.
+__plsql_leak_report :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
 
-	if len(track.allocation_map) > 0 {
-		fmt.printf("=== Memory Leaks Detected ===\n")
-		for _, entry in track.allocation_map {
-			fmt.printf("- %v bytes @ %v\n", entry.size, entry.location)
-		}
-		fmt.printf("=============================\n")
-		result_text(ctx, "Leaks detected! Check stdout.", -1, SQLITE_TRANSIENT)
-	} else {
-		fmt.printf("=== No Memory Leaks ===\n")
-		result_text(ctx, "No leaks detected.", -1, SQLITE_TRANSIENT)
-	}
+	used := memory_used()
+	high := memory_highwater(0)
 
-	// Also print memory stats
-	fmt.printf("Total Allocated: %v bytes\n", track.total_memory_allocated)
-	fmt.printf("Current Allocation Count: %v\n", len(track.allocation_map))
+	fmt.printf("=== SQLite Memory Stats ===\n")
+	fmt.printf("Current Memory Used: %v bytes\n", used)
+	fmt.printf("Highwater Mark:      %v bytes\n", high)
+	fmt.printf("(Note: PL/SQL allocations use system allocator and are not included above)\n")
+
+	if DEBUG_ENABLED && tracking_allocator_initialized {
+		fmt.printf("\n=== PL/SQL Tracking Allocator Stats ===\n")
+		fmt.printf("Total Allocations: %d\n", tracking_allocator.total_allocation_count)
+		fmt.printf("Total Frees:       %d\n", tracking_allocator.total_free_count)
+
+		if len(tracking_allocator.allocation_map) > 0 {
+			fmt.printf("!!! %d DETECTED LEAKS !!!\n", len(tracking_allocator.allocation_map))
+			for _, entry in tracking_allocator.allocation_map {
+				fmt.printf("- %v bytes at %v\n", entry.size, entry.location)
+			}
+		} else {
+			fmt.printf("No leaks detected in PL/SQL runtime.\n")
+		}
+		fmt.printf("========================================\n")
+	}
+	fmt.printf("===========================\n")
+
+	msg := fmt.tprintf("Used: %d, High: %d", used, high)
+	result_text(ctx, strings.clone_to_cstring(msg), -1, SQLITE_TRANSIENT)
 }

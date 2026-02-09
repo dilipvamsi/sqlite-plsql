@@ -1,16 +1,21 @@
--- Case 1: Iteration & Math (100k rows)
-.load build/plsqlite
+-- Case 1: Iterative Logic with Transformation (100k rows)
 
-SELECT register_plsql('weighted_sum', '', '
-    DECLARE total = 0.0;
+DROP TABLE IF EXISTS iteration_results;
+CREATE TABLE iteration_results(val REAL);
+
+SELECT register_plsql('weighted_sum_insert', '', '
     FOR r IN (SELECT val FROM data) LOOP
-        IF (@r.val > 50) THEN SET total = @total + (@r.val * 1.5);
-        ELSE SET total = @total + @r.val; END IF;
+        IF (@r.val > 50) THEN
+            INSERT INTO iteration_results(val) VALUES (@r.val * 1.5);
+        ELSE
+            INSERT INTO iteration_results(val) VALUES (@r.val);
+        END IF;
     END LOOP;
-    RETURN @total;
 ');
 
 SELECT 'CASE: Iteration';
 .timer on
-SELECT run_plsql('weighted_sum');
+SELECT run_plsql('weighted_sum_insert');
 .timer off
+
+SELECT 'Inserted count:', count(*) FROM iteration_results;

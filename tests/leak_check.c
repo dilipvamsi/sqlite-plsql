@@ -1,6 +1,5 @@
 #include <sqlite3.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 /* Comprehensive leak check covering all PL/SQLite functions and code paths */
 
@@ -244,8 +243,7 @@ int main() {
   /* Concatenate strings to create a large value (~32KB) */
   exec_sql(db,
            "SELECT register_plsql('p_large_str', '', 'DECLARE s = ''x''; "
-           "FOR i IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 "
-           "FROM cnt WHERE x<12) SELECT x FROM cnt) LOOP "
+           "RANGE i IN (1, 12) LOOP "
            "  SET s = (SELECT @s || @s); "
            "END LOOP; "
            "RETURN length(@s);');",

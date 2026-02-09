@@ -352,6 +352,42 @@ create_function :: proc "c" (
 	)
 }
 
+create_function_v2 :: proc "c" (
+	db: ^sqlite3,
+	name: cstring,
+	nArg: c.int,
+	eTextRep: c.int,
+	p: rawptr,
+	xFunc: proc "c" (ctx: ^sqlite3_context, n: c.int, v: [^]^sqlite3_value),
+	xStep: proc "c" (ctx: ^sqlite3_context, n: c.int, v: [^]^sqlite3_value),
+	xFinal: proc "c" (ctx: ^sqlite3_context),
+	xDestroy: proc "c" (p: rawptr),
+) -> c.int {
+	if api == nil || api.create_function_v2 == nil do return 1
+	fn := cast(proc "c" (
+		_: ^sqlite3,
+		_: cstring,
+		_: c.int,
+		_: c.int,
+		_: rawptr,
+		_: rawptr,
+		_: rawptr,
+		_: rawptr,
+		_: rawptr,
+	) -> c.int)api.create_function_v2
+	return fn(
+		db,
+		name,
+		nArg,
+		eTextRep,
+		p,
+		cast(rawptr)xFunc,
+		cast(rawptr)xStep,
+		cast(rawptr)xFinal,
+		cast(rawptr)xDestroy,
+	)
+}
+
 exec :: proc "c" (
 	db: ^sqlite3,
 	sql: cstring,
@@ -454,6 +490,12 @@ context_db_handle :: proc "c" (ctx: ^sqlite3_context) -> ^sqlite3 {
 	return fn(ctx)
 }
 
+user_data :: proc "c" (ctx: ^sqlite3_context) -> rawptr {
+	if api == nil || api.user_data == nil do return nil
+	fn := cast(proc "c" (_: ^sqlite3_context) -> rawptr)api.user_data
+	return fn(ctx)
+}
+
 value_type :: proc "c" (val: ^sqlite3_value) -> c.int {
 	if api == nil || api.value_type == nil do return SQLITE_NULL
 	fn := cast(proc "c" (_: ^sqlite3_value) -> c.int)api.value_type
@@ -545,8 +587,54 @@ SQLITE_TEXT :: 3
 SQLITE_BLOB :: 4
 SQLITE_NULL :: 5
 
+SQLITE_TRACE_STMT :: 0x01
+SQLITE_TRACE_PROFILE :: 0x02
+SQLITE_TRACE_ROW :: 0x04
+SQLITE_TRACE_CLOSE :: 0x08
+
 reset :: proc "c" (stmt: ^sqlite3_stmt) -> c.int {
 	if api == nil || api.reset == nil do return 1
 	fn := cast(proc "c" (_: ^sqlite3_stmt) -> c.int)api.reset
 	return fn(stmt)
+}
+
+malloc :: proc "c" (n: c.int) -> rawptr {
+	if api == nil || api.malloc == nil do return nil
+	fn := cast(proc "c" (_: c.int) -> rawptr)api.malloc
+	return fn(n)
+}
+
+realloc :: proc "c" (p: rawptr, n: c.int) -> rawptr {
+	if api == nil || api.realloc == nil do return nil
+	fn := cast(proc "c" (_: rawptr, _: c.int) -> rawptr)api.realloc
+	return fn(p, n)
+}
+
+free :: proc "c" (p: rawptr) {
+	if api == nil || api.free == nil do return
+	fn := cast(proc "c" (_: rawptr))api.free
+	fn(p)
+}
+
+memory_used :: proc "c" () -> i64 {
+	if api == nil || api.memory_used == nil do return 0
+	fn := cast(proc "c" () -> i64)api.memory_used
+	return fn()
+}
+
+memory_highwater :: proc "c" (reset: c.int) -> i64 {
+	if api == nil || api.memory_highwater == nil do return 0
+	fn := cast(proc "c" (_: c.int) -> i64)api.memory_highwater
+	return fn(reset)
+}
+
+trace_v2 :: proc "c" (
+	db: ^sqlite3,
+	mask: c.uint,
+	xCallback: proc "c" (t: c.uint, db_ptr: rawptr, p: rawptr, x: rawptr) -> c.int,
+	pCtx: rawptr,
+) -> c.int {
+	if api == nil || api.trace_v2 == nil do return 1
+	fn := cast(proc "c" (_: ^sqlite3, _: c.uint, _: rawptr, _: rawptr) -> c.int)api.trace_v2
+	return fn(db, mask, cast(rawptr)xCallback, pCtx)
 }

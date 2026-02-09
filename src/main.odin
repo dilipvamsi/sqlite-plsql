@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 
 // Global API pointer (declared in sqlite.odin)
@@ -37,6 +38,12 @@ validate_transpiled_sql :: proc "c" (db: ^sqlite3, sql: string) -> cstring {
 // It transpiles the PL/SQL body into standard SQL and stores it in the `__plsql_procedures` table.
 register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	conn := (^ConnectionContext)(user_data(ctx))
+	if conn == nil {
+		result_error(ctx, "Internal Error: Connection Context not found", -1)
+		return
+	}
+
 	if nArg < 3 {
 		result_error(ctx, "register_plsql requires 3 arguments: name, args, body", -1)
 		return
@@ -84,6 +91,23 @@ register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 		delete(c_args)
 		delete(c_body)
 		delete(c_transpiled)
+
+		// Invalidate cache for this procedure
+		if p, ok := conn.procedure_cache[name]; ok {
+			for i := 0; i < len(p.stmts_pool); i += 1 {
+				stmts := &p.stmts_pool[i]
+				for st in stmts {
+					finalize(st)
+				}
+				clear(stmts)
+			}
+			clear(&p.stmts_pool)
+			// We can keep the proc object but clear statements to force re-prepare
+			if p.transpiled_sql != transpiled {
+				delete(p.transpiled_sql)
+				p.transpiled_sql = strings.clone(transpiled)
+			}
+		}
 	}
 
 	result_text(ctx, "Procedure registered successfully", -1, SQLITE_TRANSIENT)
@@ -97,6 +121,12 @@ register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 // and error propagation.
 run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
 	context = plsqlite_context()
+	conn := (^ConnectionContext)(user_data(ctx))
+	if conn == nil {
+		result_error(ctx, "Internal Error: Connection Context not found", -1)
+		return
+	}
+
 	if nArg < 1 {
 		result_error(ctx, "run_plsql requires at least 1 argument: procedure name", -1)
 		return
@@ -129,7 +159,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		// source_code := string(column_text(stmt, 1)) // Unused
 		transpiled := string(column_text(stmt, 2))
 
-		if !scope_push(name) {
+		if !scope_push(conn, name) {
 			err_msg := strings.clone_to_cstring("PL/SQL recursion limit exceeded")
 			defer delete(err_msg)
 			result_error(ctx, err_msg, -1)
@@ -137,7 +167,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		}
 
 		// Bind arguments
-		bind_procedure_arguments(args_def, nArg, apArg)
+		bind_procedure_arguments(conn, args_def, nArg, apArg)
 
 		// Execute transpiled SQL
 		// Start a savepoint for transaction management within the procedure
@@ -146,13 +176,23 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		defer delete(c_savepoint)
 		exec(db, c_savepoint, nil, nil, nil)
 
-		c_transpiled := strings.clone_to_cstring(transpiled)
-		rc := exec(db, c_transpiled, exec_callback, nil, nil)
-		delete(c_transpiled)
+		// OPTIMIZATION: Use Procedure Statement Cache
+		depth := scope_depth(conn, name)
+		stmts, ok_p := get_procedure_stmts(conn, db, name, transpiled, depth)
+		success := false
+		if ok_p && len(stmts) > 0 {
+			success = execute_stmts(conn, db, stmts, true)
+		} else {
+			// Fallback to exec (should not happen if registered correctly)
+			c_transpiled := strings.clone_to_cstring(transpiled)
+			rc := exec(db, c_transpiled, exec_callback, conn, nil)
+			delete(c_transpiled)
+			success = (rc == SQLITE_OK || rc == SQLITE_DONE)
+		}
 
-		if rc != SQLITE_OK && rc != SQLITE_DONE {
+		if !success {
 			// If error and not a normal RETURN, rollback
-			if !current_scope_top.stop_execution || current_scope_top.is_error {
+			if !conn.current_scope_top.stop_execution || conn.current_scope_top.is_error {
 				// Capture error message before rollback clears it
 				c_msg := errmsg(db)
 				msg_str := ""
@@ -179,7 +219,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 				defer delete(final_msg)
 
 				result_error(ctx, final_msg, -1)
-				scope_pop(false)
+				scope_pop(conn, false)
 				return
 			}
 			// If stop_execution is true, it might be a RETURN which aborts exec.
@@ -191,27 +231,39 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		defer delete(c_release)
 		exec(db, c_release, nil, nil, nil)
 
-		if current_scope_top.has_returned {
-			val := current_scope_top.return_value
+		log_debug(
+			"Run PLSQL: name=%s, has_returned=%v, stop_execution=%v",
+			name,
+			conn.current_scope_top.has_returned,
+			conn.current_scope_top.stop_execution,
+		)
+		if conn.current_scope_top.has_returned {
+			val := conn.current_scope_top.return_value
+			log_debug("Return Value set, processing switch")
 			switch v in val {
 			case i64:
+				log_debug("Returning i64: %d", v)
 				result_int64(ctx, v)
 			case f64:
+				log_debug("Returning f64: %f", v)
 				result_double(ctx, v)
 			case string:
+				log_debug("Returning string: %s", v)
 				c_val := strings.clone_to_cstring(v)
 				defer delete(c_val)
 				result_text(ctx, c_val, -1, SQLITE_TRANSIENT)
 			case []byte:
+				log_debug("Returning blob, len=%d", len(v))
 				result_blob(ctx, raw_data(v), c.int(len(v)), SQLITE_TRANSIENT)
 			case:
+				log_debug("Returning NULL (unhandled or nil case)")
 				result_null(ctx)
 			}
 		} else {
 			result_null(ctx)
 		}
 
-		scope_pop(false) // Don't propagate stop_execution out of the procedure call
+		scope_pop(conn, false) // Don't propagate stop_execution out of the procedure call
 	} else {
 		err_msg := fmt.tprintf("Procedure not found: %s", name)
 		c_err_msg := strings.clone_to_cstring(err_msg)
@@ -222,7 +274,12 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 
 // bind_procedure_arguments parses the argument definition string and binds the provided
 // values to the current scope. It supports typed values (Integer, Float, Text, Blob, Null).
-bind_procedure_arguments :: proc(args_def_str: string, nArg: c.int, apArg: [^]^sqlite3_value) {
+bind_procedure_arguments :: proc(
+	ctx: ^ConnectionContext,
+	args_def_str: string,
+	nArg: c.int,
+	apArg: [^]^sqlite3_value,
+) {
 	if len(args_def_str) == 0 {
 		return
 	}
@@ -271,13 +328,13 @@ bind_procedure_arguments :: proc(args_def_str: string, nArg: c.int, apArg: [^]^s
 				}
 			}
 
-			if current_scope_top != nil {
-				if trimmed_name in current_scope_top.variables {
-					old_val := current_scope_top.variables[trimmed_name]
+			if ctx.current_scope_top != nil {
+				if trimmed_name in ctx.current_scope_top.variables {
+					old_val := ctx.current_scope_top.variables[trimmed_name]
 					free_sqlite_value(old_val)
-					current_scope_top.variables[trimmed_name] = var_val
+					ctx.current_scope_top.variables[trimmed_name] = var_val
 				} else {
-					current_scope_top.variables[strings.clone(trimmed_name)] = var_val
+					ctx.current_scope_top.variables[strings.clone(trimmed_name)] = var_val
 				}
 			} else {
 				// Should not happen if scope_push called correctly
@@ -300,26 +357,91 @@ sqlite3_extension_init :: proc "c" (
 	context = plsqlite_context()
 	api = pApi
 
+	// Initialize debug flag
+	debug_env := os.get_env("PLSQL_DEBUG")
+	DEBUG_ENABLED = debug_env == "1" || debug_env == "true"
+	if DEBUG_ENABLED {
+		fmt.println("[PLSQL] Debug logging ENABLED")
+	}
+
 	// Create metadata table
 	sql := "CREATE TABLE IF NOT EXISTS __plsql_procedures (name TEXT PRIMARY KEY, args TEXT, source_code TEXT, transpiled_sql TEXT);"
 	c_sql := strings.clone_to_cstring(sql)
 	defer delete(c_sql)
 	if exec(db, c_sql, nil, nil, pzErrMsg) != SQLITE_OK do return 1
 
+	// Initialize Per-Connection Context
+	ctx := create_connection_context()
+	ctx.ref_count = 11 // 11 registered functions
+
+	// Register close hook to finalize statements before connection closes
+	trace_v2(db, SQLITE_TRACE_CLOSE, close_hook, ctx)
+
 	// Register internal functions
-	create_function(db, "__env_set", 3, SQLITE_UTF8, nil, __env_set, nil, nil)
-	create_function(db, "__env_get", 2, SQLITE_UTF8, nil, __env_get, nil, nil)
-	create_function(db, "__env_return", 1, SQLITE_UTF8, nil, __env_return, nil, nil)
-	create_function(db, "__run_if", 3, SQLITE_UTF8, nil, __run_if, nil, nil)
-	create_function(db, "__proc_loop", 4, SQLITE_UTF8, nil, __proc_loop, nil, nil)
-	create_function(db, "__env_raise", 1, SQLITE_UTF8, nil, __env_raise, nil, nil)
+	create_function_v2(db, "__env_set", 3, SQLITE_UTF8, ctx, __env_set, nil, nil, ctx_release)
+	create_function_v2(db, "__env_get", 2, SQLITE_UTF8, ctx, __env_get, nil, nil, ctx_release)
+	create_function_v2(
+		db,
+		"__env_return",
+		1,
+		SQLITE_UTF8,
+		ctx,
+		__env_return,
+		nil,
+		nil,
+		ctx_release,
+	)
+	create_function_v2(db, "__run_if", 3, SQLITE_UTF8, ctx, __run_if, nil, nil, ctx_release)
+	create_function_v2(db, "__proc_loop", 4, SQLITE_UTF8, ctx, __proc_loop, nil, nil, ctx_release)
+	create_function_v2(
+		db,
+		"__range_loop",
+		6,
+		SQLITE_UTF8,
+		ctx,
+		__range_loop,
+		nil,
+		nil,
+		ctx_release,
+	)
+	create_function_v2(db, "__env_raise", 1, SQLITE_UTF8, ctx, __env_raise, nil, nil, ctx_release)
 
 	// Register public functions
-	create_function(db, "register_plsql", 3, SQLITE_UTF8, nil, register_plsql_func, nil, nil)
-	create_function(db, "run_plsql", -1, SQLITE_UTF8, nil, run_plsql_func, nil, nil)
-	create_function(db, "os_getenv", 1, SQLITE_UTF8, nil, os_getenv, nil, nil)
+	create_function_v2(
+		db,
+		"register_plsql",
+		3,
+		SQLITE_UTF8,
+		ctx,
+		register_plsql_func,
+		nil,
+		nil,
+		ctx_release,
+	)
+	create_function_v2(
+		db,
+		"run_plsql",
+		-1,
+		SQLITE_UTF8,
+		ctx,
+		run_plsql_func,
+		nil,
+		nil,
+		ctx_release,
+	)
+	create_function_v2(db, "os_getenv", 1, SQLITE_UTF8, ctx, os_getenv, nil, nil, ctx_release)
 
-	create_function(db, "__plsql_leak_report", 0, SQLITE_UTF8, nil, plsql_leak_report, nil, nil)
+	create_function_v2(
+		db,
+		"__plsql_leak_report",
+		0,
+		SQLITE_UTF8,
+		ctx,
+		__plsql_leak_report,
+		nil,
+		nil,
+		ctx_release,
+	)
 
 	return SQLITE_OK
 }

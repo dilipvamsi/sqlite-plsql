@@ -1,30 +1,17 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
+	"benchmarks/go/utils"
 )
 
-func getExtPath() string {
-	abs, _ := filepath.Abs("../../build")
-	if runtime.GOOS == "windows" {
-		return filepath.Join(abs, "plsqlite.dll")
-	}
-	return filepath.Join(abs, "plsqlite.so")
-}
-
-const dbPath = "../../databases/bench.db"
-
 func setupAccounts() {
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := utils.GetConnection(false)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -33,11 +20,12 @@ func setupAccounts() {
 }
 
 func benchAppLayer(n int) float64 {
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := utils.GetConnection(false)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	db.Exec("UPDATE accounts SET balance = 1000.0")
 
 	start := time.Now()
 	for i := 1; i <= n; i++ {
@@ -58,16 +46,12 @@ func benchAppLayer(n int) float64 {
 }
 
 func benchPLSQLite(n int) float64 {
-	driverName := fmt.Sprintf("sqlite3_pl_%d", time.Now().UnixNano())
-	sql.Register(driverName, &sqlite3.SQLiteDriver{
-		Extensions: []string{getExtPath()},
-	})
-
-	db, err := sql.Open(driverName, dbPath)
+	db, err := utils.GetConnection(true)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	db.Exec("UPDATE accounts SET balance = 1000.0")
 
 	db.Exec(`
         SELECT register_plsql('transfer', 'from_id, to_id, amount', '
@@ -89,21 +73,29 @@ func benchPLSQLite(n int) float64 {
 }
 
 func benchPLSQLiteBatched(n int) float64 {
-	driverName := fmt.Sprintf("sqlite3_pl_batch_%d", time.Now().UnixNano())
-	sql.Register(driverName, &sqlite3.SQLiteDriver{
-		Extensions: []string{getExtPath()},
-	})
-
-	db, err := sql.Open(driverName, dbPath)
+	db, err := utils.GetConnection(true)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	db.Exec("UPDATE accounts SET balance = 1000.0")
+
+	db.Exec(`
+        SELECT register_plsql('transfer', 'from_id, to_id, amount', '
+            DECLARE bal = 0.0;
+            SET bal = (SELECT balance FROM accounts WHERE id = @from_id);
+            IF (@bal >= @amount) THEN
+                UPDATE accounts SET balance = balance - @amount WHERE id = @from_id;
+                UPDATE accounts SET balance = balance + @amount WHERE id = @to_id;
+            END IF;
+            RETURN @bal;
+        ');
+    `)
 
 	db.Exec(`
         SELECT register_plsql('batch_transfer', 'n', '
-            FOR i IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-                CALL transfer(@i.x, @i.x + 1, 10.0);
+            RANGE i IN (1, @n) LOOP
+                CALL transfer(@i, @i + 1, 10.0);
             END LOOP;
             RETURN "DONE";
         ');
@@ -134,5 +126,7 @@ func main() {
 	plBatchTime := benchPLSQLiteBatched(n)
 	fmt.Printf("RESULT: Transactions: PL/SQLite Batch: %.2fms\n", plBatchTime)
 
-	fmt.Printf("Speedup (App vs Batch): %.2fx\n", appTime/plBatchTime)
+	if plBatchTime > 0 {
+		fmt.Printf("Speedup (App vs Batch): %.2fx\n", appTime/plBatchTime)
+	}
 }

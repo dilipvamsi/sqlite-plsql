@@ -48,7 +48,7 @@ debug: $(BUILD_DIR)
 	$(ODIN) build $(ODIN_SRC) -build-mode:shared -out:$(BUILD_DIR)/plsqlite.so -debug
 
 test: linux
-	python3 -m unittest tests.test_plsqlite -v
+	PLSQL_DEBUG=1 python3 -m unittest tests.test_plsqlite -v
 
 # Valgrind leak check (requires C runner)
 leak-check: linux
@@ -155,11 +155,17 @@ install-wine-python:
 	fi
 
 # 5. Full Benchmarks with Report
-bench: linux setup-bench-db
-	@python3 benchmarks/reporter.py
+bench: bench-file bench-memory
 
-bench-report: linux setup-bench-db
-	@python3 benchmarks/reporter.py
+bench-file: linux setup-bench-db
+	@echo "\n>>> RUNNING FILE-BASED BENCHMARKS <<<"
+	@BENCH_USE_MEMORY=0 python3 benchmarks/reporter.py
+
+bench-memory: linux
+	@echo "\n>>> RUNNING IN-MEMORY BENCHMARKS <<<"
+	@BENCH_USE_MEMORY=1 python3 benchmarks/reporter.py
+
+bench-report: bench-file bench-memory
 
 bench-python: linux
 	@echo "--- Python Benchmarks ---"
@@ -167,6 +173,7 @@ bench-python: linux
 	@cd benchmarks/python && python3 02_bulk_inserts.py
 	@cd benchmarks/python && python3 03_recursion.py
 	@cd benchmarks/python && python3 04_transactions.py
+	@cd benchmarks/python && python3 05_range_loop.py
 
 bench-node: linux
 	@echo "--- Node.js Benchmarks ---"
@@ -174,6 +181,7 @@ bench-node: linux
 	@cd benchmarks/node && node 02_bulk_inserts.js
 	@cd benchmarks/node && node 03_recursion.js
 	@cd benchmarks/node && node 04_transactions.js
+	@cd benchmarks/node && node 05_range_loop.js
 
 bench-go: linux build-go-bench
 	@echo "--- Go Benchmarks ---"
@@ -181,6 +189,7 @@ bench-go: linux build-go-bench
 	@cd benchmarks/go && ./bin/02_bulk_inserts
 	@cd benchmarks/go && ./bin/03_recursion
 	@cd benchmarks/go && ./bin/04_transactions
+	@cd benchmarks/go && ./bin/05_range_loop
 
 bench-rust: linux
 	@echo "--- Rust Benchmarks ---"
@@ -188,13 +197,23 @@ bench-rust: linux
 	@cd benchmarks/rust && cargo run --release --bin 02_bulk_inserts
 	@cd benchmarks/rust && cargo run --release --bin 03_recursion
 	@cd benchmarks/rust && cargo run --release --bin 04_transactions
+	@cd benchmarks/rust && cargo run --release --bin 05_range_loop
 
 bench-sql: linux
 	@echo "--- SQL CLI Benchmarks ---"
-	@sqlite3 databases/bench.db < benchmarks/sql/01_iteration_math.sql
-	@sqlite3 databases/bench.db < benchmarks/sql/02_bulk_inserts.sql
-	@sqlite3 databases/bench.db < benchmarks/sql/03_recursion.sql
-	@sqlite3 databases/bench.db < benchmarks/sql/04_transactions.sql
+	@if [ "$(BENCH_USE_MEMORY)" = "1" ] || [ "$(BENCH_USE_MEMORY)" = "true" ]; then \
+		sqlite3 :memory: ".read benchmarks/sql/seed.sql" ".load build/plsqlite.so" ".read benchmarks/sql/01_iteration_math.sql"; \
+		sqlite3 :memory: ".read benchmarks/sql/seed.sql" ".load build/plsqlite.so" ".read benchmarks/sql/02_bulk_inserts.sql"; \
+		sqlite3 :memory: ".read benchmarks/sql/seed.sql" ".load build/plsqlite.so" ".read benchmarks/sql/03_recursion.sql"; \
+		sqlite3 :memory: ".read benchmarks/sql/seed.sql" ".load build/plsqlite.so" ".read benchmarks/sql/04_transactions.sql"; \
+		sqlite3 :memory: ".read benchmarks/sql/seed.sql" ".load build/plsqlite.so" ".read benchmarks/sql/05_range_loop.sql"; \
+	else \
+		sqlite3 databases/bench.db ".load build/plsqlite.so" ".read benchmarks/sql/01_iteration_math.sql"; \
+		sqlite3 databases/bench.db ".load build/plsqlite.so" ".read benchmarks/sql/02_bulk_inserts.sql"; \
+		sqlite3 databases/bench.db ".load build/plsqlite.so" ".read benchmarks/sql/03_recursion.sql"; \
+		sqlite3 databases/bench.db ".load build/plsqlite.so" ".read benchmarks/sql/04_transactions.sql"; \
+		sqlite3 databases/bench.db ".load build/plsqlite.so" ".read benchmarks/sql/05_range_loop.sql"; \
+	fi
 
 setup-bench:
 	@echo "Setting up benchmark dependencies..."
@@ -213,6 +232,7 @@ build-go-bench:
 	@cd benchmarks/go && go build -o bin/02_bulk_inserts ./02_bulk_inserts/
 	@cd benchmarks/go && go build -o bin/03_recursion ./03_recursion/
 	@cd benchmarks/go && go build -o bin/04_transactions ./04_transactions/
+	@cd benchmarks/go && go build -o bin/05_range_loop ./05_range_loop/
 
 setup-bench-db:
 	@echo "Initializing benchmark database..."

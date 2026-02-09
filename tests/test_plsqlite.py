@@ -87,7 +87,59 @@ class TestPLSQLite(unittest.TestCase):
         self.conn.execute("INSERT INTO multi_col VALUES (1, 'a', 1.5), (2, 'b', 2.5);")
         self.conn.execute("SELECT register_plsql('multi_col_loop', '', 'DECLARE result = \"\"; FOR r IN (SELECT id, name, val FROM multi_col) LOOP SET result = @result || @r.id || @r.name; END LOOP; RETURN @result;');")
         result = self.conn.execute("SELECT run_plsql('multi_col_loop');").fetchone()[0]
+        if result != "1a2b":
+            self._debug_sql('multi_col_loop')
         self.assertEqual(result, "1a2b")
+
+    def test_range_loop_basic(self):
+        self.conn.execute("SELECT register_plsql('range_basic', '', 'DECLARE s = 0; RANGE i IN (1, 5, 1) LOOP SET s = @s + @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_basic');").fetchone()[0]
+        self.assertEqual(result, 15)
+
+    def test_range_loop_variable(self):
+        self.conn.execute("SELECT register_plsql('range_var', 'n', 'DECLARE s = 0; RANGE i IN (1, @n, 1) LOOP SET s = @s + @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_var', 10);").fetchone()[0]
+        self.assertEqual(result, 55)
+
+    def test_range_loop_decreasing(self):
+        self.conn.execute("SELECT register_plsql('range_dec', '', 'DECLARE s = \"\"; RANGE i IN (3, 1, -1) LOOP SET s = @s || @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_dec');").fetchone()[0]
+        self.assertEqual(result, "321")
+
+    def test_range_loop_step_zero(self):
+        self.conn.execute("SELECT register_plsql('range_zero', '', 'RANGE i IN (1, 5, 0) LOOP RETURN 1; END LOOP;');")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.conn.execute("SELECT run_plsql('range_zero');")
+
+    def test_range_loop_no_exec(self):
+        self.conn.execute("SELECT register_plsql('range_no_exec', '', 'DECLARE s = 0; RANGE i IN (10, 1, 1) LOOP SET s = 1; END LOOP; RETURN @s;');")
+        # Now an error because 10 is not < 1 for step 1
+        with self.assertRaisesRegex(sqlite3.OperationalError, "Increasing RANGE loop end must be > start"):
+            self.conn.execute("SELECT run_plsql('range_no_exec');")
+
+    def test_range_loop_real(self):
+        # Pure float range
+        self.conn.execute("SELECT register_plsql('range_real', '', 'DECLARE s = 0.0; RANGE i IN (0.1, 0.5, 0.1) LOOP SET s = @s + @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_real');").fetchone()[0]
+        # Sum of 0.1, 0.2, 0.3, 0.4, 0.5 = 1.5
+        self.assertAlmostEqual(result, 1.5)
+
+        # Mixed int/float range
+        self.conn.execute("SELECT register_plsql('range_mixed', '', 'DECLARE s = 0.0; RANGE i IN (1, 2.5, 0.5) LOOP SET s = @s + @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_mixed');").fetchone()[0]
+        # values: 1.0, 1.5, 2.0, 2.5. Sum = 7.0
+        self.assertAlmostEqual(result, 7.0)
+
+        # Decreasing float range
+        self.conn.execute("SELECT register_plsql('range_dec_real', '', 'DECLARE s = \"\"; RANGE i IN (1.5, 0.5, -0.5) LOOP SET s = @s || @i || \" \"; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_dec_real');").fetchone()[0]
+        self.assertEqual(result.strip(), "1.5 1.0 0.5")
+
+    def test_range_loop_default_step(self):
+        # Default step should be 1
+        self.conn.execute("SELECT register_plsql('range_default', '', 'DECLARE s = 0; RANGE i IN (1, 5) LOOP SET s = @s + @i; END LOOP; RETURN @s;');")
+        result = self.conn.execute("SELECT run_plsql('range_default');").fetchone()[0]
+        self.assertEqual(result, 15)
 
     def test_nested_loops_and_logic(self):
         self.conn.execute("CREATE TABLE categories (id INTEGER, name TEXT);")
@@ -181,7 +233,6 @@ class TestPLSQLite(unittest.TestCase):
         self.assertIn("UPDATE t SET x = 10", sql)
         self.assertIn("__env_set('p4', 'y', 20)", sql)
         self.conn.execute("DROP TABLE t;")
-
 
         # 5. Nested Loops Quoting
         self.conn.execute("SELECT register_plsql('p5', '', 'FOR i IN (SELECT 1) LOOP FOR j IN (SELECT 2) LOOP RETURN @i.x; END LOOP; END LOOP;');")

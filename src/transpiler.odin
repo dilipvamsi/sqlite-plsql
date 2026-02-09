@@ -34,7 +34,17 @@ is_boundary :: proc(s: string, idx: int) -> bool {
 	prev := rune(s[idx - 1])
 	curr := rune(s[idx])
 
-	return is_alphanumeric(prev) != is_alphanumeric(curr)
+	res := is_alphanumeric(prev) != is_alphanumeric(curr)
+	log_debug(
+		"is_boundary: idx=%d, prev=%c(%v), curr=%c(%v), res=%v",
+		idx,
+		prev,
+		is_alphanumeric(prev),
+		curr,
+		is_alphanumeric(curr),
+		res,
+	)
+	return res
 }
 
 // find_keyword searches for a keyword in the string `s` starting from `start_idx`.
@@ -45,6 +55,7 @@ find_keyword :: proc(s: string, keyword: string, start_idx: int) -> int {
 	for i := start_idx; i <= len(s) - len(keyword); i += 1 {
 		if has_prefix_insensitive(s[i:], keyword) {
 			if is_boundary(s, i) && is_boundary(s, i + len(keyword)) {
+				log_debug("find_keyword: matched %s at %d", keyword, i)
 				return i
 			}
 		}
@@ -119,7 +130,8 @@ transpile_variables :: proc(sql: string, proc_name: string) -> string {
 					name := var_full_name[dot_idx + 1:]
 					fmt.sbprintf(&builder, "__env_get('%s', '%s')", scope, name)
 				} else {
-					// Format: @variable -> __env_get('current_proc', 'variable')
+					// Format: @variable -> __env_get('proc', 'variable')
+					// We use the proc name as a boundary marker for search-up logic
 					fmt.sbprintf(&builder, "__env_get('%s', '%s')", proc_name, var_full_name)
 				}
 			} else {
@@ -384,10 +396,7 @@ transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
 		}
 
 		// FOR
-		if !in_quote &&
-		   has_prefix_insensitive(sql[idx:], "FOR") &&
-		   is_boundary(sql, idx) &&
-		   is_boundary(sql, idx + 3) {
+		if !in_quote && find_keyword(sql, "FOR", idx) == idx {
 			in_abs := find_keyword(sql, "IN", idx + 3)
 			loop_abs := -1
 			if in_abs != -1 {
@@ -411,6 +420,7 @@ transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
 					defer delete(quoted_query)
 					defer delete(quoted_body)
 
+					log_debug("Matched FOR loop: var=%s", var_name)
 					fmt.sbprintf(
 						&builder,
 						"SELECT __proc_loop('%s', '%s', '%s', '%s');",
@@ -422,6 +432,93 @@ transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
 					idx = end_rel + 8
 					if idx < len(sql) && sql[idx] == ';' do idx += 1
 					continue
+				}
+			}
+		}
+
+		// RANGE i IN (start, end, step) LOOP
+		if !in_quote && find_keyword(sql, "RANGE", idx) == idx {
+			log_debug("Found potential RANGE at %d in proc %s", idx, proc_name)
+			log_debug("Found potential RANGE at %d", idx)
+			in_abs := find_keyword(sql, "IN", idx + 5)
+			loop_abs := -1
+			if in_abs != -1 {
+				log_debug("Found potential IN at %d: %s", in_abs, sql[in_abs:in_abs + 2])
+				loop_abs = find_keyword(sql, "LOOP", in_abs + 2)
+			}
+			if loop_abs != -1 {
+				log_debug("Found potential LOOP at %d: %s", loop_abs, sql[loop_abs:loop_abs + 4])
+			} else {
+				log_debug("Failed to find LOOP after IN at %d", in_abs)
+			}
+
+			if in_abs != -1 && loop_abs != -1 {
+				end_rel := find_matching_block(sql, loop_abs, "LOOP", "END LOOP")
+				log_debug("find_matching_block returned end_rel=%d", end_rel)
+				if end_rel != -1 {
+					var_name := strings.trim_space(sql[idx + 5:in_abs])
+					range_expr := strings.trim_space(sql[in_abs + 2:loop_abs])
+					log_debug("RANGE loop: var=%s expr=%s", var_name, range_expr)
+
+					// Parse range_expr: (start, end, step)
+					if len(range_expr) > 0 &&
+					   range_expr[0] == '(' &&
+					   range_expr[len(range_expr) - 1] == ')' {
+						trimmed_range := range_expr[1:len(range_expr) - 1]
+
+						// Smart split by comma, respecting balanced parentheses
+						parts := make([dynamic]string)
+						defer {
+							for p in parts do delete(p)
+							delete(parts)
+						}
+
+						start := 0
+						depth := 0
+						for i := 0; i < len(trimmed_range); i += 1 {
+							if trimmed_range[i] == '(' do depth += 1
+							else if trimmed_range[i] == ')' do depth -= 1
+							else if trimmed_range[i] == ',' && depth == 0 {
+								append(&parts, strings.clone(strings.trim_space(trimmed_range[start:i])))
+								start = i + 1
+							}
+						}
+						append(&parts, strings.clone(strings.trim_space(trimmed_range[start:])))
+
+						if len(parts) >= 2 {
+							start_expr := parts[0]
+							end_expr := parts[1]
+							step_expr := len(parts) >= 3 ? parts[2] : "1"
+							transpiled_start := transpile_plsqlite_recursive(start_expr, proc_name)
+							transpiled_end := transpile_plsqlite_recursive(end_expr, proc_name)
+							transpiled_step := transpile_plsqlite_recursive(step_expr, proc_name)
+							defer delete(transpiled_start)
+							defer delete(transpiled_end)
+							defer delete(transpiled_step)
+
+							body := sql[loop_abs + 4:end_rel]
+							log_debug("RANGE loop body length: %d", len(body))
+							transpiled_body := transpile_plsqlite_recursive(body, proc_name)
+							defer delete(transpiled_body)
+
+							quoted_body := sql_quote(transpiled_body)
+							defer delete(quoted_body)
+
+							fmt.sbprintf(
+								&builder,
+								"SELECT __range_loop('%s', %s, %s, %s, '%s', '%s');",
+								var_name,
+								transpiled_start,
+								transpiled_end,
+								transpiled_step,
+								quoted_body,
+								proc_name,
+							)
+							idx = end_rel + 8
+							if idx < len(sql) && sql[idx] == ';' do idx += 1
+							continue
+						}
+					}
 				}
 			}
 		}
@@ -581,22 +678,27 @@ transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> strin
 // 5. `transpile_raises`: Converts `RAISE "msg"` to `__env_raise` calls.
 transpile_plsqlite :: proc(source: string, proc_name: string) -> string {
 	context = plsqlite_context()
+	log_debug("Transpilation Start: proc=%s", proc_name)
+
 	s1 := transpile_variables(source, proc_name)
 	defer delete(s1)
 
 	s2 := transpile_calls(s1)
 	defer delete(s2)
 
+	// Control flow (IF, FOR, RANGE) must happen before general assignments
+	// to ensure keywords are matched correctly.
 	s3 := transpile_control_flow(s2, proc_name)
 	defer delete(s3)
 
-	s4 := transpile_returns(s3)
+	s4 := transpile_assignments(s3, proc_name)
 	defer delete(s4)
 
-	s5 := transpile_assignments(s4, proc_name)
+	s5 := transpile_returns(s4)
 	defer delete(s5)
 
 	s6 := transpile_raises(s5)
+	log_debug("Transpilation End: proc=%s", proc_name)
 
 	return s6
 }

@@ -1,17 +1,14 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-
-const dbPath = path.resolve(__dirname, '../../databases/bench.db');
-const extPath = path.resolve(__dirname, '../../build/plsqlite.so');
+const { getDbConnection, loadPLSQLite } = require('./bench_utils');
 
 function setupAccounts() {
-    const db = new Database(dbPath);
+    const db = getDbConnection();
     db.prepare("UPDATE accounts SET balance = 1000.0").run();
     db.close();
 }
 
 function benchAppLayer(n = 100) {
-    const db = new Database(dbPath);
+    const db = getDbConnection();
+    db.prepare("UPDATE accounts SET balance = 1000.0").run();
     const start = Date.now();
 
     const selectStmt = db.prepare("SELECT balance FROM accounts WHERE id = ?");
@@ -36,8 +33,9 @@ function benchAppLayer(n = 100) {
 }
 
 function benchPLSQLite(n = 100) {
-    const db = new Database(dbPath);
-    db.loadExtension(extPath);
+    const db = getDbConnection();
+    db.prepare("UPDATE accounts SET balance = 1000.0").run();
+    loadPLSQLite(db);
 
     db.prepare(`
         SELECT register_plsql('transfer', 'from_id, to_id, amount', '
@@ -64,13 +62,26 @@ function benchPLSQLite(n = 100) {
 }
 
 function benchPLSQLiteBatched(n = 100) {
-    const db = new Database(dbPath);
-    db.loadExtension(extPath);
+    const db = getDbConnection();
+    db.prepare("UPDATE accounts SET balance = 1000.0").run();
+    loadPLSQLite(db);
+
+    db.prepare(`
+        SELECT register_plsql('transfer', 'from_id, to_id, amount', '
+            DECLARE bal = 0.0;
+            SET bal = (SELECT balance FROM accounts WHERE id = @from_id);
+            IF (@bal >= @amount) THEN
+                UPDATE accounts SET balance = balance - @amount WHERE id = @from_id;
+                UPDATE accounts SET balance = balance + @amount WHERE id = @to_id;
+            END IF;
+            RETURN @bal;
+        ');
+    `).run();
 
     db.prepare(`
         SELECT register_plsql('batch_transfer', 'n', '
-            FOR i IN (WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < @n) SELECT x FROM cnt) LOOP
-                CALL transfer(@i.x, @i.x + 1, 10.0);
+            RANGE i IN (1, @n) LOOP
+                CALL transfer(@i, @i + 1, 10.0);
             END LOOP;
             RETURN ''DONE'';
         ');
@@ -98,6 +109,9 @@ setupAccounts();
 const plBatchTime = benchPLSQLiteBatched(n);
 console.log(`RESULT: Transactions: PL/SQLite Batch: ${plBatchTime}ms`);
 
+if (plTime > 0) {
+    console.log(`Speedup (App vs Proc): ${(appTime / plTime).toFixed(2)}x`);
+}
 if (plBatchTime > 0) {
     console.log(`Speedup (App vs Batch): ${(appTime / plBatchTime).toFixed(2)}x`);
 }
