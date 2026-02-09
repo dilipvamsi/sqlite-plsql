@@ -67,9 +67,7 @@ __plsql_leak_report :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 	}
 	fmt.printf("===========================\n")
 
-	msg := fmt.tprintf("Used: %d, High: %d", used, high)
-	c_msg := strings.clone_to_cstring(msg)
-	defer delete(c_msg)
+	c_msg := fmt.ctprintf("Used: %d, High: %d", used, high)
 	result_text(ctx, c_msg, -1, SQLITE_TRANSIENT)
 }
 

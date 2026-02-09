@@ -12,39 +12,41 @@ import "core:strings"
 // validates the transpiled SQL by running an EXPLAIN query.
 // This ensures that the generated SQL is syntactically correct and references valid tables/columns.
 // Returns an error message if the SQL is invalid, or nil if it's valid.
-validate_transpiled_sql :: proc "c" (db: ^sqlite3, sql: string) -> cstring {
+validate_transpiled_sql :: proc "c" (db: ^sqlite3, sql: cstring, length: c.int) -> cstring {
 	context = plsqlite_context()
 	stmt: ^sqlite3_stmt
-	explain_sql := fmt.tprintf("EXPLAIN %s", sql)
-	c_explain := strings.clone_to_cstring(explain_sql)
-	defer delete(c_explain)
+	explain_sql := fmt.ctprintf("EXPLAIN %.*s", length, sql)
+	c_explain := explain_sql
 
 	if prepare_v2(db, c_explain, -1, &stmt, nil) != SQLITE_OK {
 		msg := errmsg(db)
-		full_msg := fmt.tprintf("Invalid SQL in procedure: %s", msg)
-		return strings.clone_to_cstring(full_msg)
+		return fmt.ctprintf("Invalid SQL in procedure: %s", msg)
 	}
 
 	finalize(stmt)
 	return nil
 }
 
-// register_procedure_internal is a helper to handle both DB persistence and cache invalidation.
 register_procedure_internal :: proc(
 	ctx: ^sqlite3_context,
 	conn: ^ConnectionContext,
-	name: string,
-	args_def: string,
-	body: string,
+	name: cstring,
+	args_def: cstring,
+	body: cstring,
 ) -> bool {
 	db := context_db_handle(ctx)
-	transpiled := transpile_plsqlite(body, name)
+	body_str := string(body)
+	name_str := string(name)
+	transpiled := transpile_plsqlite(body_str, name_str)
 	defer delete(transpiled)
 
 	// Validate transpiled SQL
-	if err_msg := validate_transpiled_sql(db, transpiled); err_msg != nil {
+	if err_msg := validate_transpiled_sql(
+		db,
+		cstring(raw_data(transpiled)),
+		c.int(len(transpiled)),
+	); err_msg != nil {
 		result_error(ctx, err_msg, -1)
-		delete(err_msg)
 		return false
 	}
 
@@ -54,25 +56,19 @@ register_procedure_internal :: proc(
 	)
 
 	if prepare_v2(db, c_insert_sql, -1, &stmt, nil) == SQLITE_OK {
-		c_name := strings.clone_to_cstring(name, context.temp_allocator)
-		c_args := strings.clone_to_cstring(args_def, context.temp_allocator)
-		c_body := strings.clone_to_cstring(body, context.temp_allocator)
-		c_transpiled := strings.clone_to_cstring(transpiled, context.temp_allocator)
-
-
-		bind_text(stmt, 1, c_name, -1, SQLITE_TRANSIENT)
-		bind_text(stmt, 2, c_args, -1, SQLITE_TRANSIENT)
-		bind_text(stmt, 3, c_body, -1, SQLITE_TRANSIENT)
-		bind_text(stmt, 4, c_transpiled, -1, SQLITE_TRANSIENT)
+		bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT)
+		bind_text(stmt, 2, args_def, -1, SQLITE_TRANSIENT)
+		bind_text(stmt, 3, body, -1, SQLITE_TRANSIENT)
+		bind_text(stmt, 4, cstring(raw_data(transpiled)), c.int(len(transpiled)), SQLITE_TRANSIENT)
 
 		step(stmt)
 		finalize(stmt)
 
 		// Invalidate cache for this procedure in the current connection
-		if p, ok := conn.procedure_cache[name]; ok {
+		if p, ok := conn.procedure_cache[name_str]; ok {
 			for i := 0; i < len(p.stmts_pool); i += 1 {
 				stmts := &p.stmts_pool[i]
-				for st in stmts {
+				for st in stmts^ {
 					finalize(st)
 				}
 				clear(stmts)
@@ -83,9 +79,10 @@ register_procedure_internal :: proc(
 				delete(p.transpiled_sql)
 				p.transpiled_sql = strings.clone(transpiled)
 			}
-			if p.args_def != args_def {
+			args_def_str := string(args_def)
+			if p.args_def != args_def_str {
 				delete(p.args_def)
-				p.args_def = strings.clone(args_def)
+				p.args_def = strings.clone(args_def_str)
 			}
 		}
 		return true
@@ -115,9 +112,9 @@ register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 		return
 	}
 
-	name := string(value_text(apArg[0]))
-	args_def := string(value_text(apArg[1]))
-	body := string(value_text(apArg[2]))
+	name := value_text(apArg[0])
+	args_def := value_text(apArg[1])
+	body := value_text(apArg[2])
 
 	if register_procedure_internal(ctx, conn, name, args_def, body) {
 		result_text(ctx, "Procedure registered successfully", -1, SQLITE_TRANSIENT)
@@ -140,9 +137,9 @@ replace_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^s
 		return
 	}
 
-	name := string(value_text(apArg[0]))
-	args_def := string(value_text(apArg[1]))
-	body := string(value_text(apArg[2]))
+	name := value_text(apArg[0])
+	args_def := value_text(apArg[1])
+	body := value_text(apArg[2])
 
 	if register_procedure_internal(ctx, conn, name, args_def, body) {
 		result_text(ctx, "Procedure replaced successfully", -1, SQLITE_TRANSIENT)
@@ -260,9 +257,9 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		// Found the procedure, extract definition
 		args_def := string(column_text(stmt, 0))
 		// source_code := string(column_text(stmt, 1)) // Unused
-		transpiled := string(column_text(stmt, 2))
+		transpiled_cs := column_text(stmt, 2)
 
-		if !scope_push(conn, name) {
+		if !scope_push(conn, c_name) {
 			err_msg := cstring("PL/SQL recursion limit exceeded")
 			result_error(ctx, err_msg, -1)
 			return
@@ -277,16 +274,14 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		exec(db, c_savepoint_sql, nil, nil, nil)
 
 		// OPTIMIZATION: Use Procedure Statement Cache
-		depth := scope_depth(conn, name)
-		stmts, ok_p := get_procedure_stmts(conn, db, name, transpiled, depth)
+		depth := scope_depth(conn, c_name)
+		stmts, ok_p := get_procedure_stmts(conn, db, c_name, transpiled_cs, depth)
 		success := false
 		if ok_p && len(stmts) > 0 {
 			success = execute_stmts(conn, db, stmts, true)
 		} else {
 			// Fallback to exec (should not happen if registered correctly)
-			c_transpiled := strings.clone_to_cstring(transpiled)
-			rc := exec(db, c_transpiled, exec_callback, conn, nil)
-			delete(c_transpiled)
+			rc := exec(db, transpiled_cs, exec_callback, conn, nil)
 			success = (rc == SQLITE_OK || rc == SQLITE_DONE)
 		}
 
@@ -294,13 +289,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 			// If error and not a normal RETURN, rollback
 			if !conn.current_scope_top.stop_execution || conn.current_scope_top.is_error {
 				// Capture error message before rollback clears it
-				c_msg := errmsg(db)
-				msg_str := ""
-				if c_msg != nil {
-					msg_str = string(c_msg)
-				}
-				saved_msg := strings.clone(msg_str)
-				defer delete(saved_msg)
+				saved_msg := fmt.ctprintf("%s", errmsg(db))
 
 				// Rollback the transaction for this procedure call
 				rollback_sql := fmt.ctprintf("ROLLBACK TO sp_%s", name)
@@ -308,14 +297,13 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 
 				final_msg: cstring
 				if len(saved_msg) == 0 || saved_msg == "not an error" {
-					final_msg = strings.clone_to_cstring(
+					final_msg = fmt.ctprintf(
 						"PL/SQL execution failed (possible recursion limit or inner error)",
 					)
 				} else {
-					final_msg = strings.clone_to_cstring(saved_msg)
+					final_msg = fmt.ctprintf("%s", saved_msg)
 				}
-				defer delete(final_msg)
-
+				// final_msg is on temp allocator, will be freed by caller's free_all
 				result_error(ctx, final_msg, -1)
 				scope_pop(conn, false)
 				return
@@ -329,7 +317,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 
 		log_debug(
 			"Run PLSQL: name=%s, has_returned=%v, stop_execution=%v",
-			name,
+			c_name,
 			conn.current_scope_top.has_returned,
 			conn.current_scope_top.stop_execution,
 		)
@@ -343,11 +331,9 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 			case f64:
 				log_debug("Returning f64: %f", v)
 				result_double(ctx, v)
-			case string:
-				log_debug("Returning string: %s", v)
-				c_val := strings.clone_to_cstring(v)
-				defer delete(c_val)
-				result_text(ctx, c_val, -1, SQLITE_TRANSIENT)
+			case cstring:
+				log_debug("Returning cstring: %s", v)
+				result_text(ctx, v, -1, SQLITE_TRANSIENT)
 			case []byte:
 				log_debug("Returning blob, len=%d", len(v))
 				result_blob(ctx, raw_data(v), c.int(len(v)), SQLITE_TRANSIENT)
@@ -395,31 +381,13 @@ bind_procedure_arguments :: proc(
 			case SQLITE_FLOAT:
 				var_val = value_double(apArg[i + 1])
 			case SQLITE_TEXT:
-				text_ptr := value_text(apArg[i + 1])
-				if text_ptr != nil {
-					var_val = strings.clone(string(text_ptr))
-				} else {
-					var_val = nil
-				}
+				var_val = value_clone_text(apArg[i + 1])
 			case SQLITE_BLOB:
-				blob_ptr := value_blob(apArg[i + 1])
-				blob_bytes := value_bytes(apArg[i + 1])
-				if blob_ptr != nil && blob_bytes > 0 {
-					data := make([]byte, blob_bytes)
-					mem.copy(raw_data(data), blob_ptr, int(blob_bytes))
-					var_val = data
-				} else {
-					var_val = nil
-				}
+				var_val = value_clone_blob(apArg[i + 1])
 			case SQLITE_NULL:
 				var_val = nil
 			case:
-				text_ptr := value_text(apArg[i + 1])
-				if text_ptr != nil {
-					var_val = strings.clone(string(text_ptr))
-				} else {
-					var_val = nil
-				}
+				var_val = value_clone_text(apArg[i + 1])
 			}
 
 			if ctx.current_scope_top != nil {

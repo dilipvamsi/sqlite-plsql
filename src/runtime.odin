@@ -7,6 +7,7 @@ import "core:mem"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:unicode"
 
 // Scope represents a single execution context (stack frame) for a procedure call.
 // It stores local variables, return values, and tracks the execution state (e.g., if a RETURN statement was hit).
@@ -107,7 +108,7 @@ MAX_RECURSION_DEPTH :: 500
 SqliteValue :: union {
 	i64,
 	f64,
-	string,
+	cstring,
 	[]byte, // BLOB support
 	// nil represents NULL
 }
@@ -124,7 +125,7 @@ log_debug :: proc(format: string, args: ..any) {
 
 free_sqlite_value :: proc(val: SqliteValue) {
 	switch v in val {
-	case string:
+	case cstring:
 		delete(v)
 	case []byte:
 		delete(v)
@@ -132,6 +133,42 @@ free_sqlite_value :: proc(val: SqliteValue) {
 	case f64:
 	case: // nil
 	}
+}
+
+value_clone_text :: proc(val: ^sqlite3_value) -> cstring {
+	ptr := value_text(val)
+	if ptr == nil do return nil
+	len := value_bytes(val)
+	s := strings.string_from_ptr(transmute([^]u8)ptr, int(len))
+	return strings.clone_to_cstring(s)
+}
+
+column_clone_text :: proc(stmt: ^sqlite3_stmt, i: c.int) -> cstring {
+	ptr := column_text(stmt, i)
+	if ptr == nil do return nil
+	len := column_bytes(stmt, i)
+	s := strings.string_from_ptr(transmute([^]u8)ptr, int(len))
+	return strings.clone_to_cstring(s)
+}
+
+value_clone_blob :: proc(val: ^sqlite3_value) -> []byte {
+	context = plsqlite_context()
+	ptr := value_blob(val)
+	size := int(value_bytes(val))
+	if ptr == nil || size <= 0 do return nil
+	data := make([]byte, size)
+	mem.copy(raw_data(data), ptr, size)
+	return data
+}
+
+column_clone_blob :: proc(stmt: ^sqlite3_stmt, i: c.int) -> []byte {
+	context = plsqlite_context()
+	ptr := column_blob(stmt, i)
+	size := int(column_bytes(stmt, i))
+	if ptr == nil || size <= 0 do return nil
+	data := make([]byte, size)
+	mem.copy(raw_data(data), ptr, size)
+	return data
 }
 
 // free_scope_cache finalizes all cached statements and frees memory
@@ -148,8 +185,8 @@ free_scope_cache :: proc(s: ^Scope) {
 
 clone_sqlite_value :: proc(val: SqliteValue) -> SqliteValue {
 	switch v in val {
-	case string:
-		return strings.clone(v)
+	case cstring:
+		return strings.clone_to_cstring(string(v))
 	case []byte:
 		return slice.clone(v)
 	case i64:
@@ -163,11 +200,12 @@ clone_sqlite_value :: proc(val: SqliteValue) -> SqliteValue {
 
 // scope_depth counts how many times the given procedure is currently on the stack.
 // This is used to determine the index into the statement pool for recursion.
-scope_depth :: proc(ctx: ^ConnectionContext, name: string) -> int {
+scope_depth :: proc(ctx: ^ConnectionContext, name: cstring) -> int {
 	count := 0
 	curr := ctx.current_scope_top
+	name_str := string(name)
 	for curr != nil {
-		if curr.is_procedure && curr.proc_name == name {
+		if curr.is_procedure && curr.proc_name == name_str {
 			count += 1
 		}
 		curr = curr.prev
@@ -176,12 +214,12 @@ scope_depth :: proc(ctx: ^ConnectionContext, name: string) -> int {
 }
 
 // scope_push creates a new scope for a procedure call and pushes it onto the scope stack.
-scope_push :: proc(ctx: ^ConnectionContext, name: string, is_transient := false) -> bool {
+scope_push :: proc(ctx: ^ConnectionContext, name: cstring, is_transient := false) -> bool {
 	if ctx.current_scope_top != nil && ctx.current_scope_top.depth >= MAX_RECURSION_DEPTH {
 		return false
 	}
 	new_s := new(Scope)
-	new_s.proc_name = strings.clone(name)
+	new_s.proc_name = strings.clone(string(name))
 	new_s.variables = make(map[string]SqliteValue)
 	new_s.prev = ctx.current_scope_top
 	if ctx.current_scope_top != nil {
@@ -190,10 +228,15 @@ scope_push :: proc(ctx: ^ConnectionContext, name: string, is_transient := false)
 		new_s.depth = 1
 	}
 	new_s.is_transient = is_transient
-	new_s.is_procedure = (name != "" && !is_transient)
+	new_s.is_procedure = (name != nil && (cast([^]u8)name)[0] != 0 && !is_transient)
 	new_s.stmt_cache = make(map[string][dynamic]^sqlite3_stmt)
 	ctx.current_scope_top = new_s
-	log_debug("Scope Push: name=%s, transient=%v, depth=%d", name, is_transient, new_s.depth)
+	log_debug(
+		"Scope Push: name=%s, transient=%v, depth=%d",
+		new_s.proc_name,
+		is_transient,
+		new_s.depth,
+	)
 	return true
 }
 
@@ -242,18 +285,20 @@ get_cache_scope :: proc(ctx: ^ConnectionContext) -> ^Scope {
 get_cached_stmts :: proc(
 	conn: ^ConnectionContext,
 	db: ^sqlite3,
-	sql: string,
+	sql: cstring,
 ) -> (
 	[dynamic]^sqlite3_stmt,
 	bool,
 ) {
-	if len(sql) == 0 do return nil, true
+	if sql == nil || (cast([^]u8)sql)[0] == 0 do return nil, true
 
 	s := get_cache_scope(conn)
 	if s == nil do return nil, false
 
+	sql_str := string(sql)
+
 	// Check cache
-	if stmts, ok := s.stmt_cache[sql]; ok {
+	if stmts, ok := s.stmt_cache[sql_str]; ok {
 		return stmts, true
 	}
 
@@ -261,13 +306,11 @@ get_cached_stmts :: proc(
 	stmts := make([dynamic]^sqlite3_stmt)
 
 	remaining := sql
-	for len(remaining) > 0 {
+	for remaining != nil && (cast([^]u8)remaining)[0] != 0 {
 		stmt: ^sqlite3_stmt
 		tail: cstring
-		c_sql := strings.clone_to_cstring(remaining)
-		defer delete(c_sql)
 
-		rc := prepare_v2(db, c_sql, -1, &stmt, &tail)
+		rc := prepare_v2(db, remaining, -1, &stmt, &tail)
 		if rc != SQLITE_OK {
 			// Cleanup on error
 			for st in stmts do finalize(st)
@@ -284,17 +327,17 @@ get_cached_stmts :: proc(
 			break
 		}
 
-		// Calculate offset
-		bytes_consumed := uintptr(rawptr(tail)) - uintptr(rawptr(c_sql))
-		if int(bytes_consumed) >= len(remaining) {
-			break
+		remaining = tail
+		// Trim leading space manually if needed, but SQLite's tail usually points to next stmt
+		for remaining != nil &&
+		    (cast([^]u8)remaining)[0] != 0 &&
+		    unicode.is_space(rune((cast([^]u8)remaining)[0])) {
+			remaining = cstring(rawptr(uintptr(rawptr(remaining)) + 1))
 		}
-		remaining = remaining[bytes_consumed:]
-		remaining = strings.trim_left_space(remaining)
 	}
 
 	// Cache it
-	key := strings.clone(sql)
+	key := strings.clone(sql_str)
 	s.stmt_cache[key] = stmts
 	return stmts, true
 }
@@ -304,19 +347,20 @@ get_cached_stmts :: proc(
 get_procedure_stmts :: proc(
 	ctx: ^ConnectionContext,
 	db: ^sqlite3,
-	name: string,
-	transpiled_sql: string,
+	name: cstring,
+	transpiled_sql: cstring,
 	depth: int,
 ) -> (
 	[dynamic]^sqlite3_stmt,
 	bool,
 ) {
-	proc_obj, ok := ctx.procedure_cache[name]
+	name_str := string(name)
+	proc_obj, ok := ctx.procedure_cache[name_str]
 	if !ok {
 		// Create new procedure object
 		proc_obj = new(Procedure)
-		proc_obj.name = strings.clone(name)
-		proc_obj.transpiled_sql = strings.clone(transpiled_sql)
+		proc_obj.name = strings.clone(name_str)
+		proc_obj.transpiled_sql = strings.clone(string(transpiled_sql))
 		proc_obj.stmts_pool = make([dynamic][dynamic]^sqlite3_stmt)
 		ctx.procedure_cache[proc_obj.name] = proc_obj
 	}
@@ -332,14 +376,12 @@ get_procedure_stmts :: proc(
 	}
 
 	// Prepare statements for this specific depth
-	remaining := proc_obj.transpiled_sql
-	for len(remaining) > 0 {
+	remaining := transpiled_sql
+	for remaining != nil && (cast([^]u8)remaining)[0] != 0 {
 		stmt: ^sqlite3_stmt
 		tail: cstring
-		c_sql := strings.clone_to_cstring(remaining)
-		defer delete(c_sql)
 
-		rc := prepare_v2(db, c_sql, -1, &stmt, &tail)
+		rc := prepare_v2(db, remaining, -1, &stmt, &tail)
 		if rc != SQLITE_OK {
 			for st in stmts^ do finalize(st)
 			clear(stmts)
@@ -354,12 +396,12 @@ get_procedure_stmts :: proc(
 			break
 		}
 
-		bytes_consumed := uintptr(rawptr(tail)) - uintptr(rawptr(c_sql))
-		if int(bytes_consumed) >= len(remaining) {
-			break
+		remaining = tail
+		for remaining != nil &&
+		    (cast([^]u8)remaining)[0] != 0 &&
+		    unicode.is_space(rune((cast([^]u8)remaining)[0])) {
+			remaining = cstring(rawptr(uintptr(rawptr(remaining)) + 1))
 		}
-		remaining = remaining[bytes_consumed:]
-		remaining = strings.trim_left_space(remaining)
 	}
 
 	return stmts^, true
@@ -472,31 +514,13 @@ __env_set :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_va
 	case SQLITE_FLOAT:
 		var_val = value_double(apArg[2])
 	case SQLITE_TEXT:
-		text_ptr := value_text(apArg[2])
-		if text_ptr != nil {
-			var_val = strings.clone(string(text_ptr))
-		} else {
-			var_val = nil
-		}
+		var_val = value_clone_text(apArg[2])
 	case SQLITE_BLOB:
-		blob_ptr := value_blob(apArg[2])
-		blob_bytes := value_bytes(apArg[2])
-		if blob_ptr != nil && blob_bytes > 0 {
-			data := make([]byte, blob_bytes)
-			mem.copy(raw_data(data), blob_ptr, int(blob_bytes))
-			var_val = data
-		} else {
-			var_val = nil
-		}
+		var_val = value_clone_blob(apArg[2])
 	case SQLITE_NULL:
 		var_val = nil
 	case:
-		text_ptr := value_text(apArg[2])
-		if text_ptr != nil {
-			var_val = strings.clone(string(text_ptr))
-		} else {
-			var_val = nil
-		}
+		var_val = value_clone_text(apArg[2])
 	}
 
 	// Scope resolution:
@@ -572,12 +596,8 @@ __env_get :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_va
 				result_int64(ctx, v)
 			case f64:
 				result_double(ctx, v)
-			case string:
-				if len(v) > 0 {
-					result_text(ctx, cstring(raw_data(v)), c.int(len(v)), SQLITE_TRANSIENT)
-				} else {
-					result_text(ctx, "", 0, SQLITE_TRANSIENT)
-				}
+			case cstring:
+				result_text(ctx, v, -1, SQLITE_TRANSIENT)
 			case []byte:
 				result_blob(ctx, raw_data(v), c.int(len(v)), SQLITE_TRANSIENT)
 			case:
@@ -622,21 +642,13 @@ __env_return :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 		var_val = v
 		log_debug("Env Return: f64=%f", v)
 	case SQLITE_TEXT:
-		txt := value_text(apArg[0])
-		if txt != nil {
-			s := strings.clone(string(txt))
-			var_val = s
-			log_debug("Env Return: string=%s", s)
-		}
+		cs := value_clone_text(apArg[0])
+		var_val = cs
+		log_debug("Env Return: cstring=%s", cs)
 	case SQLITE_BLOB:
-		blob_ptr := value_blob(apArg[0])
-		blob_bytes := value_bytes(apArg[0])
-		if blob_ptr != nil && blob_bytes > 0 {
-			data := make([]byte, blob_bytes)
-			mem.copy(raw_data(data), blob_ptr, int(blob_bytes))
-			var_val = data
-			log_debug("Env Return: blob, len=%d", len(data))
-		}
+		data := value_clone_blob(apArg[0])
+		var_val = data
+		log_debug("Env Return: blob, len=%d", len(data))
 	case:
 		// NULL
 		log_debug("Env Return: received NULL")
@@ -720,12 +732,9 @@ __run_if :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_val
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 
 	db := context_db_handle(ctx)
-	cond_query := string(value_text(apArg[0]))
-	true_sql := string(value_text(apArg[1]))
-	false_sql := string(value_text(apArg[2]))
 
 	// 1. Evaluate Condition
-	cond_stmts, ok := get_cached_stmts(conn, db, cond_query)
+	cond_stmts, ok := get_cached_stmts(conn, db, value_text(apArg[0]))
 	if !ok || len(cond_stmts) == 0 {
 		result_error(ctx, "Failed to prepare condition SQL", -1)
 		return
@@ -746,8 +755,8 @@ __run_if :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_val
 	reset(stmt) // Always reset
 
 	// 2. Execute Branch
-	target_sql := cond_result ? true_sql : false_sql
-	if len(target_sql) > 0 {
+	target_sql := cond_result ? value_text(apArg[1]) : value_text(apArg[2])
+	if target_sql != nil && (cast([^]u8)target_sql)[0] != 0 {
 		stmts, ok := get_cached_stmts(conn, db, target_sql)
 		if !ok {
 			result_error(ctx, "Failed to prepare branch SQL", -1)
@@ -770,13 +779,12 @@ __proc_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 
 	db := context_db_handle(ctx)
-	query := string(value_text(apArg[0]))
-	body_sql := string(value_text(apArg[1]))
 	var_name := string(value_text(apArg[2]))
 	proc_name := string(value_text(apArg[3]))
 
 	// Prepare Loop Query (Cached)
-	query_stmts, ok_q := get_cached_stmts(conn, db, query)
+	c_query := value_text(apArg[0])
+	query_stmts, ok_q := get_cached_stmts(conn, db, c_query)
 	if !ok_q || len(query_stmts) == 0 {
 		result_error(ctx, "Failed to prepare loop query", -1)
 		return
@@ -786,8 +794,9 @@ __proc_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_
 	// Prepare Body Statements (Cached)
 	// We optimize by fetching them once before the loop
 	body_stmts: [dynamic]^sqlite3_stmt
-	if len(body_sql) > 0 {
-		bs, ok_b := get_cached_stmts(conn, db, body_sql)
+	body_sql_cs := value_text(apArg[1])
+	if body_sql_cs != nil && (cast([^]u8)body_sql_cs)[0] != 0 {
+		bs, ok_b := get_cached_stmts(conn, db, body_sql_cs)
 		if !ok_b {
 			result_error(ctx, "Failed to prepare loop body", -1)
 			return
@@ -798,7 +807,8 @@ __proc_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_
 	// Optimization: Persistent Loop Scope (reduces allocations)
 	// We use the iterator name as the scope name to isolate it,
 	// while allowing transparent lookup of other variables in the parent.
-	scope_push(conn, var_name, true)
+	c_var_name := value_text(apArg[2])
+	scope_push(conn, c_var_name, true)
 
 	// Loop over the result set
 	for step(stmt) == SQLITE_ROW && !conn.current_scope_top.stop_execution {
@@ -838,13 +848,13 @@ extract_column_value :: proc(stmt: ^sqlite3_stmt, i: c.int) -> SqliteValue {
 	case SQLITE_FLOAT:
 		return column_double(stmt, i)
 	case SQLITE_TEXT:
-		ptr := column_text(stmt, i)
-		return strings.clone(string(ptr)) if ptr != nil else nil
+		return column_clone_text(stmt, i)
+	case SQLITE_BLOB:
+		return column_clone_blob(stmt, i)
 	case SQLITE_NULL:
 		return nil
 	case:
-		ptr := column_text(stmt, i)
-		return strings.clone(string(ptr)) if ptr != nil else nil
+		return column_clone_text(stmt, i)
 	}
 }
 
@@ -857,10 +867,11 @@ __range_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 	if conn == nil || conn.current_scope_top == nil || conn.current_scope_top.stop_execution do return
 
 	db := context_db_handle(ctx)
-	var_name := string(value_text(apArg[0]))
-	body_sql := string(value_text(apArg[4]))
+	c_var_name_range := value_text(apArg[0])
+	var_name := string(c_var_name_range)
+	c_body_sql := value_text(apArg[4])
 
-	body_stmts, ok_b := get_cached_stmts(conn, db, body_sql)
+	body_stmts, ok_b := get_cached_stmts(conn, db, c_body_sql)
 	if !ok_b {
 		result_error(ctx, "Failed to prepare loop body", -1)
 		return
@@ -871,7 +882,8 @@ __range_loop :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 		value_type(apArg[2]) == SQLITE_FLOAT ||
 		value_type(apArg[3]) == SQLITE_FLOAT
 
-	scope_push(conn, var_name, true)
+	c_var_name := value_text(apArg[0])
+	scope_push(conn, c_var_name, true)
 	// Pre-insert with start value to ensure key exists and avoid repeated clones
 	cloned_var_name := strings.clone(var_name)
 	conn.current_scope_top.variables[cloned_var_name] = nil
