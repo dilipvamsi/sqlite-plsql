@@ -8,9 +8,23 @@ is_alphanumeric :: proc(r: rune) -> bool {
 	return unicode.is_alpha(r) || unicode.is_digit(r) || r == '_'
 }
 
+// Safe slice helper to avoid out-of-bounds access on invalid UTF-8 or short strings
+safe_slice :: proc(s: string, start, end: int) -> string {
+	if start < 0 || start >= len(s) || end < start {
+		return ""
+	}
+	real_end := end
+	if real_end > len(s) {
+		real_end = len(s)
+	}
+	return s[start:real_end]
+}
+
 has_prefix_insensitive :: proc(s, prefix: string) -> bool {
 	if len(s) < len(prefix) do return false
-	return strings.equal_fold(s[:len(prefix)], prefix)
+	// Use slice safely
+	check := safe_slice(s, 0, len(prefix))
+	return strings.equal_fold(check, prefix)
 }
 
 is_boundary :: proc(s: string, idx: int) -> bool {
@@ -39,6 +53,7 @@ find_keyword :: proc(s: string, keyword: string, start_idx: int) -> int {
 }
 
 sql_quote :: proc(s: string, allocator := context.allocator) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make(allocator)
 	for i in 0 ..< len(s) {
 		if s[i] == '\'' {
@@ -66,6 +81,7 @@ find_closing_paren :: proc(s: string, start_idx: int) -> int {
 
 // Pass 1: Variable substitution (@var -> __env_get)
 transpile_variables :: proc(sql: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -123,6 +139,7 @@ transpile_variables :: proc(sql: string, proc_name: string) -> string {
 // transpile_calls finds all `CALL proc_name(args)` patterns and replaces them with
 // `run_plsql('proc_name', args)`. This allows procedures to be called as part of SQL expressions.
 transpile_calls :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -226,6 +243,7 @@ transpile_calls :: proc(sql: string) -> string {
 // transpile_returns finds `RETURN expr;` statements and converts them into
 // `SELECT __env_return(expr);`. This ensures proper return value handling and execution stopping.
 transpile_returns :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -305,6 +323,7 @@ find_matching_block :: proc(s: string, start_idx: int, open_tag, close_tag: stri
 // It recursively finds blocks and transforms them into calls to `__run_if` and `__proc_loop`.
 // It handles nested blocks by finding matching END tags.
 transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -417,7 +436,9 @@ transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
 // transpile_assignments converts variable declarations and assignments (DECLARE/SET)
 // into `SELECT __env_set(...)` calls. It ensures variables are properly scoped.
 transpile_assignments :: proc(sql: string, proc_name: string) -> string {
-	builder := strings.builder_make()
+	context = plsqlite_context()
+	builder: strings.Builder
+	strings.builder_init(&builder, context.allocator)
 	idx := 0
 	in_quote := false
 
@@ -432,13 +453,13 @@ transpile_assignments :: proc(sql: string, proc_name: string) -> string {
 		if !in_quote {
 			is_assign := false
 			keyword_len := 0
-			if has_prefix_insensitive(sql[idx:], "DECLARE") &&
+			if has_prefix_insensitive(safe_slice(sql, idx, len(sql)), "DECLARE") &&
 			   is_boundary(sql, idx) &&
 			   is_boundary(sql, idx + 7) {
 				is_assign = true
 				keyword_len = 7
 				for idx + keyword_len < len(sql) && unicode.is_space(rune(sql[idx + keyword_len])) do keyword_len += 1
-			} else if has_prefix_insensitive(sql[idx:], "SET") &&
+			} else if has_prefix_insensitive(safe_slice(sql, idx, len(sql)), "SET") &&
 			   is_boundary(sql, idx) &&
 			   is_boundary(sql, idx + 3) {
 				// Check standalone
@@ -498,6 +519,7 @@ transpile_assignments :: proc(sql: string, proc_name: string) -> string {
 
 // transpile_raises converts `RAISE "msg";` into `SELECT __env_raise("msg");`
 transpile_raises :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -534,6 +556,7 @@ transpile_raises :: proc(sql: string) -> string {
 }
 
 transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	trimmed := strings.trim_space(source)
 	if len(trimmed) == 0 do return strings.clone("")
 
@@ -557,6 +580,7 @@ transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> strin
 // 4. `transpile_assignments`: Converts `DECLARE` and `SET` to `__env_set` calls.
 // 5. `transpile_raises`: Converts `RAISE "msg"` to `__env_raise` calls.
 transpile_plsqlite :: proc(source: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	s1 := transpile_variables(source, proc_name)
 	defer delete(s1)
 

@@ -52,8 +52,14 @@ test: linux
 
 # Valgrind leak check (requires C runner)
 leak-check: linux
-	$(CC) $(CFLAGS) tests/leak_check.c -o $(BUILD_DIR)/leak_check -lsqlite3
-	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 --main-stacksize=16777216 ./$(BUILD_DIR)/leak_check
+	$(CC) $(CFLAGS) tests/leak_check.c -o $(BUILD_DIR)/leak_check -lsqlite3 -I.
+	# Run Valgrind with our test runner
+	# Note: We expect some leaks from SQLite itself (suppressed usually),
+	# but we want to see if our Odin runtime leaks Scope/Statements.
+	valgrind --leak-check=full \
+		--show-leak-kinds=all \
+		--error-exitcode=1 \
+		./$(BUILD_DIR)/leak_check
 	rm -f $(BUILD_DIR)/leak_check
 
 # Coverage using python kcov

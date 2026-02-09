@@ -12,7 +12,7 @@ import "core:strings"
 // This ensures that the generated SQL is syntactically correct and references valid tables/columns.
 // Returns an error message if the SQL is invalid, or nil if it's valid.
 validate_transpiled_sql :: proc "c" (db: ^sqlite3, sql: string) -> cstring {
-	context = runtime.default_context()
+	context = plsqlite_context()
 	stmt: ^sqlite3_stmt
 	explain_sql := fmt.tprintf("EXPLAIN %s", sql)
 	c_explain := strings.clone_to_cstring(explain_sql)
@@ -36,7 +36,7 @@ validate_transpiled_sql :: proc "c" (db: ^sqlite3, sql: string) -> cstring {
 //
 // It transpiles the PL/SQL body into standard SQL and stores it in the `__plsql_procedures` table.
 register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
-	context = runtime.default_context()
+	context = plsqlite_context()
 	if nArg < 3 {
 		result_error(ctx, "register_plsql requires 3 arguments: name, args, body", -1)
 		return
@@ -96,7 +96,7 @@ register_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^
 // binds arguments, and executes the transpiled SQL. It handles transaction management (SAVEPOINT/ROLLBACK)
 // and error propagation.
 run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
-	context = runtime.default_context()
+	context = plsqlite_context()
 	if nArg < 1 {
 		result_error(ctx, "run_plsql requires at least 1 argument: procedure name", -1)
 		return
@@ -297,7 +297,7 @@ sqlite3_extension_init :: proc "c" (
 	pzErrMsg: ^cstring,
 	pApi: ^sqlite3_api_routines,
 ) -> c.int {
-	context = runtime.default_context()
+	context = plsqlite_context()
 	api = pApi
 
 	// Create metadata table
@@ -318,6 +318,8 @@ sqlite3_extension_init :: proc "c" (
 	create_function(db, "register_plsql", 3, SQLITE_UTF8, nil, register_plsql_func, nil, nil)
 	create_function(db, "run_plsql", -1, SQLITE_UTF8, nil, run_plsql_func, nil, nil)
 	create_function(db, "os_getenv", 1, SQLITE_UTF8, nil, os_getenv, nil, nil)
+
+	create_function(db, "__plsql_leak_report", 0, SQLITE_UTF8, nil, plsql_leak_report, nil, nil)
 
 	return SQLITE_OK
 }

@@ -544,3 +544,9 @@ SQLITE_FLOAT :: 2
 SQLITE_TEXT :: 3
 SQLITE_BLOB :: 4
 SQLITE_NULL :: 5
+
+reset :: proc "c" (stmt: ^sqlite3_stmt) -> c.int {
+	if api == nil || api.reset == nil do return 1
+	fn := cast(proc "c" (_: ^sqlite3_stmt) -> c.int)api.reset
+	return fn(stmt)
+}

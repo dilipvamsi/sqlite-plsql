@@ -14,8 +14,10 @@ The core of PL/SQLite is implemented in **Odin**, a data-oriented language desig
 
 - **Named Scopes**: Secure namespacing for variables. Each procedure owns its scope, preventing accidental overlaps while allowing explicit cross-procedure access using the `@proc_name.variable` syntax.
 - **Transpiler Architecture**: Automatically converts high-level PL/SQLite source code into optimized "Engine SQL" function calls.
-- **Zero-Copy Runtime**: Executes logic without the overhead of context-switching between your application language (Python/Go/JS) and the database.
-- **Atomic Transactions**: Procedures are wrapped in SQLite `SAVEPOINT`s, ensuring that any error triggers a full rollback of the procedure's operations.
+- **Zero-Copy Runtime**: Executes logic without the overhead of context-switching between your application language and the database. Strings are passed as pointers (zero-copy) for reads.
+- **Statement Caching**: Automatically caches prepared SQLite statements within procedure scopes, drastically reducing overhead for loops and recursive calls.
+- **Scope Persistence**: Reuses memory scopes and variable maps during loops, eliminating allocation churn for high-performance iteration.
+- **Atomic Transactions**: Procedures are wrapped in SQLite `SAVEPOINT`s, ensuring that any error triggers a full rollback.
 
 ---
 
@@ -91,7 +93,7 @@ SELECT register_plsql('validate_user', 'id', '
 
 | Use Case | Application Layer | PL/SQLite | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Simple Iteration** | ~10-70 ms | ~800 ms | App-layer is faster for local files |
+| **Simple Iteration** | ~10-70 ms | **~130 ms** | **6x Faster** (prev ~800ms) 🚀 |
 | **Bulk Inserts** | ~100 ms | ~120 ms | Near-native overhead |
 | **Complex Transactions** | **~750 ms** | **~65 ms** | **11.5x Faster** 🔥 |
 
@@ -373,44 +375,44 @@ make bench-sql       # Run pure SQL CLI benchmarks
 
 | Language / Driver | App-Layer Logic | PL/SQLite (In-DB) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Python** (`sqlite3`) | 39.53 ms | 958.24 ms | 0.04x |
-| **Node.js** (`better-sqlite3`) | 74.00 ms | 719.00 ms | 0.10x |
-| **Go** (`go-sqlite3`) | 49.04 ms | 851.48 ms | 0.06x |
-| **Rust** (`rusqlite`) | 7.74 ms | 756.14 ms | 0.01x |
-| **SQL CLI** | N/A | 1237.80 ms | 0.03x |
+| **Python** | 38.12 ms | 142.98 ms | 0.27x |
+| **Node.js** | 67.00 ms | 133.00 ms | 0.50x |
+| **Go** | 48.21 ms | 140.76 ms | 0.34x |
+| **Rust** | 7.76 ms | 130.72 ms | 0.06x |
+| **SQL CLI** | N/A | **125.75 ms** | 0.30x |
 
 ### 2. Bulk Operations (**10k inserts**)
 Logic: One procedure call vs 10k separate `INSERT` statements in a transaction.
 
 | Language / Driver | App-Layer (Tx) | PL/SQLite (Proc) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Python** | 85.92 ms | 119.59 ms | 0.72x |
-| **Node.js** | 166.00 ms | 167.00 ms | 0.99x |
-| **Go** | 108.63 ms | 185.38 ms | 0.59x |
-| **Rust** | 77.34 ms | 119.39 ms | 0.65x |
-| **SQL CLI** | N/A | 118.33 ms | 0.73x |
+| **Python** | 117.08 ms | 141.74 ms | 0.83x |
+| **Node.js** | 152.00 ms | 377.00 ms | 0.40x |
+| **Go** | 117.08 ms | 117.24 ms | 1.00x |
+| **Rust** | 77.59 ms | 136.18 ms | 0.57x |
+| **SQL CLI** | N/A | 86.30 ms | 1.36x |
 
 ### 3. Recursive Calls (**200 depth**)
 Logic: `RETURN n + CALL rec_sum(n - 1)`
 
 | Language / Driver | App-Layer | PL/SQLite | Note |
 | :--- | :--- | :--- | :--- |
-| **Python** | 0.0379 ms | 10.14 ms | 0.00x |
-| **Node.js** | 0.0204 ms | 30.77 ms | 0.00x |
-| **Go** | 0.0005 ms | 6.66 ms | 0.00x |
-| **Rust** | 0.0001 ms | 16.24 ms | 0.00x |
-| **SQL CLI** | N/A | **26.26 ms** | Native proc-call overhead |
+| **Python** | 0.0486 ms | 12.57 ms | 0.00x |
+| **Node.js** | 0.0207 ms | 35.83 ms | 0.00x |
+| **Go** | 0.0017 ms | 15.27 ms | 0.00x |
+| **Rust** | 0.0001 ms | 17.22 ms | 0.00x |
+| **SQL CLI** | N/A | **6.79 ms** | Native proc-call overhead |
 
 ### 4. Complex Transactions (**10 transfers**)
 Logic: Account transfer involving multiple selects and updates within a single procedural call vs. multiple app-layer boundaries.
 
 | Language / Driver | App-Layer | PL/SQL Proc | PL/SQL Batch | Speedup (Batch) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Python** | 872.02 ms | 907.43 ms | 73.88 ms | **11.80x** 🔥 |
-| **Node.js** | 1625 ms | 1191 ms | 101 ms | **16.09x** 🔥 |
-| **Go** | 839.19 ms | 1299.10 ms | 92.57 ms | **9.07x** 🔥 |
-| **Rust** | 724.63 ms | 790.73 ms | 65.75 ms | **11.02x** 🔥 |
-| **SQL CLI** | N/A | N/A | **65.46 ms** | **13.32x** 🔥 |
+| **Python** | 750.04 ms | 1374.00 ms | 107.43 ms | **7.0x** 🔥 |
+| **Node.js** | 1274 ms | 1251 ms | 267 ms | **4.8x** 🔥 |
+| **Go** | 915.88 ms | 1402.56 ms | 75.61 ms | **12.1x** 🔥 |
+| **Rust** | 716.27 ms | 799.09 ms | 65.69 ms | **10.9x** 🔥 |
+| **SQL CLI** | N/A | N/A | **82.30 ms** | **9.1x** 🔥 |
 
 ### 🔍 Analysis: When to use PL/SQLite?
 1. **Networked Databases (Massive Win)**: On a networked database (e.g., Turso, rqlite, sqlite-server), the round-trip overhead makes app-layer transactions take **seconds or minutes**. PL/SQLite executes them in **milliseconds**.
@@ -434,6 +436,7 @@ Logic: Account transfer involving multiple selects and updates within a single p
 ## 🛡️ Stability & Safety
 PL/SQLite is built for production environments:
 - **Zero-Copy**: Data stays in SQLite's memory pages during execution.
-- **Memory Safe**: Verified with `Valgrind` (0 leaks reported during standard and error paths).
+- **Memory Safe**: Verified with `Valgrind` (0 leaks reported) and internal `Tracking_Allocator`.
+- **Leak Detection**: Built-in leak reporting via `SELECT __plsql_leak_report();`.
 - **Transactional**: Fully integrated with SQLite's ACID properties (Atomic Rollbacks).
 - **Infinite Recursion Protection**: Stack depth limits (500) prevent crashes.

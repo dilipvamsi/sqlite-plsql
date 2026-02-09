@@ -311,6 +311,7 @@ int main() {
   }
 
   printf("Execution finished. Closing database...\n");
+  exec_sql(db, "SELECT __plsql_leak_report();", "leak report");
   sqlite3_close(db);
 
   printf("Leak check completed. Run this with Valgrind for detailed report.\n");
