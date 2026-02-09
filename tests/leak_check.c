@@ -288,6 +288,28 @@ int main() {
     exec_sql(db, buf, "run p_nested_if");
   }
 
+  printf("=== Testing RAISE statement (error propagation/rollback) ===\n");
+  exec_sql(db,
+           "SELECT register_plsql('p_fail', '', 'RAISE \"planned error\";');",
+           "register p_fail");
+  for (int i = 0; i < 50; i++) {
+    sqlite3_exec(db, "SELECT run_plsql('p_fail');", 0, 0, 0);
+  }
+
+  printf("=== Testing Nested RAISE statement ===\n");
+  exec_sql(db, "CREATE TABLE leak_t (val TEXT);", "create leak_t");
+  exec_sql(db,
+           "SELECT register_plsql('p_child_fail', '', 'INSERT INTO leak_t "
+           "VALUES (\"data\"); RAISE \"child fail\";');",
+           "register p_child_fail");
+  exec_sql(db,
+           "SELECT register_plsql('p_parent_fail', '', 'INSERT INTO leak_t "
+           "VALUES (\"parent data\"); CALL p_child_fail();');",
+           "register p_parent_fail");
+  for (int i = 0; i < 50; i++) {
+    sqlite3_exec(db, "SELECT run_plsql('p_parent_fail');", 0, 0, 0);
+  }
+
   printf("Execution finished. Closing database...\n");
   sqlite3_close(db);
 

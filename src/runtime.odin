@@ -3,6 +3,7 @@ package plsqlite
 import "base:runtime"
 import "core:c"
 import "core:mem"
+import "core:os"
 import "core:slice"
 import "core:strings"
 
@@ -17,6 +18,7 @@ Scope :: struct {
 	// return_is_null: bool, // No longer needed, SqliteValue can be nil
 	stop_execution: bool,
 	depth:          int,
+	is_error:       bool,
 }
 
 MAX_RECURSION_DEPTH :: 500
@@ -261,11 +263,9 @@ __env_return :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 	case SQLITE_FLOAT:
 		var_val = value_double(apArg[0])
 	case SQLITE_TEXT:
-		text_ptr := value_text(apArg[0])
-		if text_ptr != nil {
-			var_val = strings.clone(string(text_ptr))
-		} else {
-			var_val = nil
+		txt := value_text(apArg[0])
+		if txt != nil {
+			var_val = strings.clone(string(txt))
 		}
 	case SQLITE_BLOB:
 		blob_ptr := value_blob(apArg[0])
@@ -274,40 +274,57 @@ __env_return :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3
 			data := make([]byte, blob_bytes)
 			mem.copy(raw_data(data), blob_ptr, int(blob_bytes))
 			var_val = data
-		} else {
-			var_val = nil
 		}
-	case SQLITE_NULL:
-		var_val = nil
-	case:
-		text_ptr := value_text(apArg[0])
-		if text_ptr != nil {
-			var_val = strings.clone(string(text_ptr))
-		} else {
-			var_val = nil
-		}
+	case: // NULL
 	}
 
-	free_sqlite_value(current_scope_top.return_value)
 	current_scope_top.return_value = var_val
 	current_scope_top.has_returned = true
 	current_scope_top.stop_execution = true
+}
 
-	// Return the value to SQLite as well, so the SELECT __env_return(...) returns it
-	switch v in var_val {
-	case i64:
-		result_int64(ctx, v)
-	case f64:
-		result_double(ctx, v)
-	case string:
-		c_val := strings.clone_to_cstring(v)
-		defer delete(c_val)
-		result_text(ctx, c_val, -1, SQLITE_TRANSIENT)
-	case []byte:
-		result_blob(ctx, raw_data(v), c.int(len(v)), SQLITE_TRANSIENT)
-	case:
-		result_null(ctx)
+// __env_raise reports a custom error message to SQLite and flags execution to stop.
+// This triggers a ROLLBACK TO savepoint in the main run_plsql loop.
+@(export)
+__env_raise :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
+	context = runtime.default_context()
+	if current_scope_top == nil do return
+
+	msg := value_text(apArg[0])
+	if msg != nil {
+		result_error(ctx, msg, -1)
+	} else {
+		result_error(ctx, "Unknown PL/SQL error", -1)
 	}
+
+	current_scope_top.stop_execution = true
+	current_scope_top.is_error = true
+}
+
+// os_getenv returns the value of an environment variable as a string, or NULL if not found.
+@(export)
+os_getenv :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlite3_value) {
+	context = runtime.default_context()
+	if nArg < 1 {
+		result_null(ctx)
+		return
+	}
+	name_ptr := value_text(apArg[0])
+	if name_ptr == nil {
+		result_null(ctx)
+		return
+	}
+	name := string(name_ptr)
+	val, ok := os.lookup_env(name)
+	if !ok {
+		result_null(ctx)
+		return
+	}
+	defer delete(val)
+
+	c_val := strings.clone_to_cstring(val)
+	defer delete(c_val)
+	result_text(ctx, c_val, -1, SQLITE_TRANSIENT)
 }
 
 // cond_callback is a utility callback used by `__run_if` to capture the result of the condition query.

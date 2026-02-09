@@ -11,6 +11,11 @@ sqlite-bin/
 win-libs/
 .xwin-cache/
 
+#benchmarks bins and packages
+benchmarks/rust/target/
+benchmarks/node/node_modules/
+benchmarks/go/bin/
+
 # Prerequisites
 *.d
 

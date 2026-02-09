@@ -1,0 +1,7 @@
+[package]
+name = "rust_benchmarks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.33.0", features = ["load_extension"] }

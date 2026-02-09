@@ -670,5 +670,37 @@ class TestPLSQLite(unittest.TestCase):
             msg = str(e).lower()
             self.assertTrue("recursion limit exceeded" in msg or "execution failed" in msg, f"Unexpected error: {msg}")
 
+    # === RAISE STATEMENT TESTS ===
+    def test_raise_basic(self):
+        self.conn.execute("SELECT register_plsql('fail', '', 'RAISE \"planned failure\";');")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "planned failure"):
+            self.conn.execute("SELECT run_plsql('fail');")
+
+    def test_raise_rollback(self):
+        self.conn.execute("CREATE TABLE test_rollback (val TEXT);")
+        # Procedure that inserts then raises
+        self.conn.execute("SELECT register_plsql('insert_and_fail', '', 'INSERT INTO test_rollback VALUES (\"should not exist\"); RAISE \"abort\";');")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            self.conn.execute("SELECT run_plsql('insert_and_fail');")
+
+        # Verify rollback worked
+        count = self.conn.execute("SELECT COUNT(*) FROM test_rollback;").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_raise_nested(self):
+        self.conn.execute("CREATE TABLE nested_rollback (val TEXT);")
+        # child raises error
+        self.conn.execute("SELECT register_plsql('child_fail', '', 'INSERT INTO nested_rollback VALUES (\"child data\"); RAISE \"child error\";');")
+        # parent calls child
+        self.conn.execute("SELECT register_plsql('parent_call', '', 'INSERT INTO nested_rollback VALUES (\"parent data\"); CALL child_fail();');")
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "child error"):
+            self.conn.execute("SELECT run_plsql('parent_call');")
+
+        # Verify both parent and child data were rolled back
+        count = self.conn.execute("SELECT COUNT(*) FROM nested_rollback;").fetchone()[0]
+        self.assertEqual(count, 0)
+
 if __name__ == "__main__":
     unittest.main()

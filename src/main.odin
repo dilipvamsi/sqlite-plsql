@@ -151,27 +151,30 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 		delete(c_transpiled)
 
 		if rc != SQLITE_OK && rc != SQLITE_DONE {
-			// If error and not forced stop (RETURN), rollback
-			if !current_scope_top.stop_execution {
+			// If error and not a normal RETURN, rollback
+			if !current_scope_top.stop_execution || current_scope_top.is_error {
+				// Capture error message before rollback clears it
+				c_msg := errmsg(db)
+				msg_str := ""
+				if c_msg != nil {
+					msg_str = string(c_msg)
+				}
+				saved_msg := strings.clone(msg_str)
+				defer delete(saved_msg)
+
 				// Rollback the transaction for this procedure call
 				rollback_sql := fmt.tprintf("ROLLBACK TO sp_%s", name)
 				c_rollback := strings.clone_to_cstring(rollback_sql)
 				defer delete(c_rollback)
 				exec(db, c_rollback, nil, nil, nil)
 
-				c_msg := errmsg(db)
-				msg_str := ""
-				if c_msg != nil {
-					msg_str = string(c_msg)
-				}
-
 				final_msg: cstring
-				if len(msg_str) == 0 || msg_str == "not an error" {
+				if len(saved_msg) == 0 || saved_msg == "not an error" {
 					final_msg = strings.clone_to_cstring(
 						"PL/SQL execution failed (possible recursion limit or inner error)",
 					)
 				} else {
-					final_msg = strings.clone_to_cstring(msg_str)
+					final_msg = strings.clone_to_cstring(saved_msg)
 				}
 				defer delete(final_msg)
 
@@ -309,10 +312,12 @@ sqlite3_extension_init :: proc "c" (
 	create_function(db, "__env_return", 1, SQLITE_UTF8, nil, __env_return, nil, nil)
 	create_function(db, "__run_if", 3, SQLITE_UTF8, nil, __run_if, nil, nil)
 	create_function(db, "__proc_loop", 4, SQLITE_UTF8, nil, __proc_loop, nil, nil)
+	create_function(db, "__env_raise", 1, SQLITE_UTF8, nil, __env_raise, nil, nil)
 
 	// Register public functions
 	create_function(db, "register_plsql", 3, SQLITE_UTF8, nil, register_plsql_func, nil, nil)
 	create_function(db, "run_plsql", -1, SQLITE_UTF8, nil, run_plsql_func, nil, nil)
+	create_function(db, "os_getenv", 1, SQLITE_UTF8, nil, os_getenv, nil, nil)
 
 	return SQLITE_OK
 }

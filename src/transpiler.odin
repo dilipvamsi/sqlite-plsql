@@ -156,14 +156,27 @@ transpile_calls :: proc(sql: string) -> string {
 					close_abs := find_closing_paren(sql, open_abs)
 					if close_abs != -1 {
 						args := sql[open_abs + 1:close_abs]
+						trimmed_args := strings.trim_space(args)
 
 						// Check if standalone statement
-						is_stmt := true
+						is_stmt := false
 						check_idx := idx - 1
 						for check_idx >= 0 && unicode.is_space(rune(sql[check_idx])) do check_idx -= 1
-						if check_idx >= 0 && sql[check_idx] != ';' do is_stmt = false
 
-						trimmed_args := strings.trim_space(args)
+						if check_idx < 0 {
+							is_stmt = true
+						} else {
+							preceding := sql[check_idx]
+							if preceding == ';' {
+								is_stmt = true
+							} else {
+								// Check for THEN, ELSE, LOOP
+								if check_idx >= 3 && has_prefix_insensitive(sql[check_idx - 3:], "THEN") do is_stmt = true
+								else if check_idx >= 3 && has_prefix_insensitive(sql[check_idx - 3:], "ELSE") do is_stmt = true
+								else if check_idx >= 3 && has_prefix_insensitive(sql[check_idx - 3:], "LOOP") do is_stmt = true
+							}
+						}
+
 						if is_stmt {
 							if len(trimmed_args) > 0 {
 								fmt.sbprintf(
@@ -175,6 +188,8 @@ transpile_calls :: proc(sql: string) -> string {
 							} else {
 								fmt.sbprintf(&builder, "SELECT run_plsql('%s');", proc_name)
 							}
+
+							// Skip the semicolon if it exists in the original source
 							semi_rel := strings.index(sql[close_abs:], ";")
 							if semi_rel != -1 {
 								idx = close_abs + semi_rel + 1
@@ -182,6 +197,7 @@ transpile_calls :: proc(sql: string) -> string {
 								idx = close_abs + 1
 							}
 						} else {
+							// Function call in an expression
 							if len(trimmed_args) > 0 {
 								fmt.sbprintf(
 									&builder,
@@ -480,6 +496,43 @@ transpile_assignments :: proc(sql: string, proc_name: string) -> string {
 	return strings.to_string(builder)
 }
 
+// transpile_raises converts `RAISE "msg";` into `SELECT __env_raise("msg");`
+transpile_raises :: proc(sql: string) -> string {
+	builder := strings.builder_make()
+	idx := 0
+	in_quote := false
+
+	for idx < len(sql) {
+		if sql[idx] == '\'' {
+			in_quote = !in_quote
+			strings.write_byte(&builder, sql[idx])
+			idx += 1
+			continue
+		}
+
+		if !in_quote &&
+		   has_prefix_insensitive(sql[idx:], "RAISE") &&
+		   is_boundary(sql, idx) &&
+		   is_boundary(sql, idx + 5) {
+			semi_idx := strings.index(sql[idx:], ";")
+			if semi_idx != -1 {
+				msg := strings.trim_space(sql[idx + 5:idx + semi_idx])
+				if len(msg) == 0 {
+					fmt.sbprintf(&builder, "SELECT __env_raise(NULL);")
+				} else {
+					fmt.sbprintf(&builder, "SELECT __env_raise(%s);", msg)
+				}
+				idx += semi_idx + 1
+				continue
+			}
+		}
+		strings.write_byte(&builder, sql[idx])
+		idx += 1
+	}
+
+	return strings.to_string(builder)
+}
+
 transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> string {
 	trimmed := strings.trim_space(source)
 	if len(trimmed) == 0 do return strings.clone("")
@@ -491,7 +544,9 @@ transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> strin
 	s3 := transpile_control_flow(s2, proc_name)
 	defer delete(s3)
 	s4 := transpile_assignments(s3, proc_name)
-	return s4
+	defer delete(s4)
+	s5 := transpile_raises(s4)
+	return s5
 }
 
 // transpile_plsqlite coordinates the transpilation process.
@@ -500,6 +555,7 @@ transpile_plsqlite_recursive :: proc(source: string, proc_name: string) -> strin
 // 2. `transpile_returns`: Converts `RETURN expr` to `__env_return` calls.
 // 3. `transpile_control_flow`: Converts `IF/ELSE` and `FOR` loops to SQL logic using `__run_if` and `__proc_loop`.
 // 4. `transpile_assignments`: Converts `DECLARE` and `SET` to `__env_set` calls.
+// 5. `transpile_raises`: Converts `RAISE "msg"` to `__env_raise` calls.
 transpile_plsqlite :: proc(source: string, proc_name: string) -> string {
 	s1 := transpile_variables(source, proc_name)
 	defer delete(s1)
@@ -514,6 +570,9 @@ transpile_plsqlite :: proc(source: string, proc_name: string) -> string {
 	defer delete(s4)
 
 	s5 := transpile_assignments(s4, proc_name)
+	defer delete(s5)
 
-	return s5
+	s6 := transpile_raises(s5)
+
+	return s6
 }
