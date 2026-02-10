@@ -75,14 +75,17 @@ register_procedure_internal :: proc(
 			}
 			clear(&p.stmts_pool)
 
-			if p.transpiled_sql != transpiled {
+			if string(p.transpiled_sql) != transpiled {
 				delete(p.transpiled_sql)
-				p.transpiled_sql = strings.clone(transpiled)
+				p.transpiled_sql = strings.clone_to_cstring(transpiled)
 			}
 			args_def_str := string(args_def)
 			if p.args_def != args_def_str {
 				delete(p.args_def)
 				p.args_def = strings.clone(args_def_str)
+				for n in p.arg_names do delete(n)
+				delete(p.arg_names)
+				p.arg_names = parse_arg_names(p.args_def)
 			}
 		}
 		return true
@@ -197,6 +200,10 @@ unregister_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^
 				delete(stmts^)
 			}
 			delete(p.stmts_pool)
+			for n in p.arg_names {
+				delete(n)
+			}
+			delete(p.arg_names)
 			delete(p.transpiled_sql)
 			delete(p.args_def)
 			delete(p.name) // This is the cloned string that was the key
@@ -255,8 +262,7 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 
 	if step(stmt) == SQLITE_ROW {
 		// Found the procedure, extract definition
-		args_def := string(column_text(stmt, 0))
-		// source_code := string(column_text(stmt, 1)) // Unused
+		args_def_cs := column_text(stmt, 0)
 		transpiled_cs := column_text(stmt, 2)
 
 		if !scope_push(conn, c_name) {
@@ -265,25 +271,25 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 			return
 		}
 
-		// Bind arguments
-		bind_procedure_arguments(conn, args_def, nArg, apArg)
+		// OPTIMIZATION: Use Procedure Statement Cache
+		depth := scope_depth(conn, c_name)
+		stmts, ok_p := get_procedure_stmts(conn, db, c_name, args_def_cs, transpiled_cs, depth)
+
+		if !ok_p {
+			result_error(ctx, "Failed to retrieve procedure statements", -1)
+			return
+		}
+
+		// Bind arguments using pre-parsed names from cache
+		proc_obj := conn.procedure_cache[name]
+		bind_procedure_arguments(conn, proc_obj.arg_names, nArg, apArg)
 
 		// Execute transpiled SQL
 		// Start a savepoint for transaction management within the procedure
 		c_savepoint_sql := fmt.ctprintf("SAVEPOINT sp_%s", name)
 		exec(db, c_savepoint_sql, nil, nil, nil)
 
-		// OPTIMIZATION: Use Procedure Statement Cache
-		depth := scope_depth(conn, c_name)
-		stmts, ok_p := get_procedure_stmts(conn, db, c_name, transpiled_cs, depth)
-		success := false
-		if ok_p && len(stmts) > 0 {
-			success = execute_stmts(conn, db, stmts, true)
-		} else {
-			// Fallback to exec (should not happen if registered correctly)
-			rc := exec(db, transpiled_cs, exec_callback, conn, nil)
-			success = (rc == SQLITE_OK || rc == SQLITE_DONE)
-		}
+		success := execute_stmts(conn, db, stmts, true)
 
 		if !success {
 			// If error and not a normal RETURN, rollback
@@ -356,21 +362,11 @@ run_plsql_func :: proc "c" (ctx: ^sqlite3_context, nArg: c.int, apArg: [^]^sqlit
 // values to the current scope. It supports typed values (Integer, Float, Text, Blob, Null).
 bind_procedure_arguments :: proc(
 	ctx: ^ConnectionContext,
-	args_def_str: string,
+	arg_names: []string,
 	nArg: c.int,
 	apArg: [^]^sqlite3_value,
 ) {
-	if len(args_def_str) == 0 {
-		return
-	}
-
-	// Bind arguments to new scope
-	args := strings.split(args_def_str, ",")
-	// clean up split results properly
-	defer delete(args)
-
-	for arg_name, i in args {
-		trimmed_name := strings.trim_space(arg_name)
+	for trimmed_name, i in arg_names {
 		if i + 1 < int(nArg) {
 			// Extract typed value
 			var_val: SqliteValue

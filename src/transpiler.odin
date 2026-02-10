@@ -92,6 +92,7 @@ find_closing_paren :: proc(s: string, start_idx: int) -> int {
 
 // Pass 1: Variable substitution (@var -> __env_get)
 transpile_variables :: proc(sql: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -150,6 +151,7 @@ transpile_variables :: proc(sql: string, proc_name: string) -> string {
 // transpile_calls finds all `CALL proc_name(args)` patterns and replaces them with
 // `run_plsql('proc_name', args)`. This allows procedures to be called as part of SQL expressions.
 transpile_calls :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -253,6 +255,7 @@ transpile_calls :: proc(sql: string) -> string {
 // transpile_returns finds `RETURN expr;` statements and converts them into
 // `SELECT __env_return(expr);`. This ensures proper return value handling and execution stopping.
 transpile_returns :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -332,6 +335,7 @@ find_matching_block :: proc(s: string, start_idx: int, open_tag, close_tag: stri
 // It recursively finds blocks and transforms them into calls to `__run_if` and `__proc_loop`.
 // It handles nested blocks by finding matching END tags.
 transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false
@@ -529,6 +533,7 @@ transpile_control_flow :: proc(sql: string, proc_name: string) -> string {
 // transpile_assignments converts variable declarations and assignments (DECLARE/SET)
 // into `SELECT __env_set(...)` calls. It ensures variables are properly scoped.
 transpile_assignments :: proc(sql: string, proc_name: string) -> string {
+	context = plsqlite_context()
 	builder: strings.Builder
 	strings.builder_init(&builder, context.allocator)
 	idx := 0
@@ -611,6 +616,7 @@ transpile_assignments :: proc(sql: string, proc_name: string) -> string {
 
 // transpile_raises converts `RAISE "msg";` into `SELECT __env_raise("msg");`
 transpile_raises :: proc(sql: string) -> string {
+	context = plsqlite_context()
 	builder := strings.builder_make()
 	idx := 0
 	in_quote := false

@@ -27,13 +27,16 @@ Scope :: struct {
 	stmt_cache:     map[string][dynamic]^sqlite3_stmt,
 	is_transient:   bool, // If true, don't cache here, look up parent (e.g., loop scopes)
 	is_procedure:   bool, // If true, this is the root scope of a procedure call
+	owns_proc_name: bool, // If false, reusing name from procedure cache
+	has_stmt_cache: bool, // If false, stmt_cache was not allocated
 }
 
 // Procedure stores cached metadata and prepared statements for a registered PL/SQL function.
 Procedure :: struct {
 	name:           string,
 	args_def:       string,
-	transpiled_sql: string,
+	arg_names:      []string,
+	transpiled_sql: cstring,
 	stmts_pool:     [dynamic][dynamic]^sqlite3_stmt, // Each index corresponds to a recursion depth
 }
 
@@ -171,8 +174,20 @@ column_clone_blob :: proc(stmt: ^sqlite3_stmt, i: c.int) -> []byte {
 	return data
 }
 
+parse_arg_names :: proc(args_def_str: string) -> []string {
+	if len(args_def_str) == 0 do return nil
+	args := strings.split(args_def_str, ",")
+	defer delete(args)
+	res := make([]string, len(args))
+	for a, i in args {
+		res[i] = strings.clone(strings.trim_space(a))
+	}
+	return res
+}
+
 // free_scope_cache finalizes all cached statements and frees memory
 free_scope_cache :: proc(s: ^Scope) {
+	if !s.has_stmt_cache do return
 	for key, stmts in s.stmt_cache {
 		for stmt in stmts {
 			finalize(stmt)
@@ -219,7 +234,14 @@ scope_push :: proc(ctx: ^ConnectionContext, name: cstring, is_transient := false
 		return false
 	}
 	new_s := new(Scope)
-	new_s.proc_name = strings.clone(string(name))
+	name_str := string(name)
+	if p, ok := ctx.procedure_cache[name_str]; ok {
+		new_s.proc_name = p.name
+		new_s.owns_proc_name = false
+	} else {
+		new_s.proc_name = strings.clone(name_str)
+		new_s.owns_proc_name = true
+	}
 	new_s.variables = make(map[string]SqliteValue)
 	new_s.prev = ctx.current_scope_top
 	if ctx.current_scope_top != nil {
@@ -229,7 +251,10 @@ scope_push :: proc(ctx: ^ConnectionContext, name: cstring, is_transient := false
 	}
 	new_s.is_transient = is_transient
 	new_s.is_procedure = (name != nil && (cast([^]u8)name)[0] != 0 && !is_transient)
-	new_s.stmt_cache = make(map[string][dynamic]^sqlite3_stmt)
+	if !is_transient {
+		new_s.stmt_cache = make(map[string][dynamic]^sqlite3_stmt)
+		new_s.has_stmt_cache = true
+	}
 	ctx.current_scope_top = new_s
 	log_debug(
 		"Scope Push: name=%s, transient=%v, depth=%d",
@@ -260,7 +285,9 @@ scope_pop :: proc(ctx: ^ConnectionContext, propagate: bool) {
 		}
 
 		log_debug("Scope Pop: name=%s, returned=%v", tmp.proc_name, tmp.has_returned)
-		delete(tmp.proc_name)
+		if tmp.owns_proc_name {
+			delete(tmp.proc_name)
+		}
 		for k, v in tmp.variables {
 			delete(k)
 			free_sqlite_value(v)
@@ -348,6 +375,7 @@ get_procedure_stmts :: proc(
 	ctx: ^ConnectionContext,
 	db: ^sqlite3,
 	name: cstring,
+	args_def: cstring,
 	transpiled_sql: cstring,
 	depth: int,
 ) -> (
@@ -360,7 +388,9 @@ get_procedure_stmts :: proc(
 		// Create new procedure object
 		proc_obj = new(Procedure)
 		proc_obj.name = strings.clone(name_str)
-		proc_obj.transpiled_sql = strings.clone(string(transpiled_sql))
+		proc_obj.args_def = strings.clone(string(args_def))
+		proc_obj.arg_names = parse_arg_names(proc_obj.args_def)
+		proc_obj.transpiled_sql = strings.clone_to_cstring(string(transpiled_sql))
 		proc_obj.stmts_pool = make([dynamic][dynamic]^sqlite3_stmt)
 		ctx.procedure_cache[proc_obj.name] = proc_obj
 	}
@@ -436,6 +466,10 @@ free_procedure_cache :: proc(ctx: ^ConnectionContext) {
 			delete(stmts^)
 		}
 		delete(p.stmts_pool)
+		for name in p.arg_names {
+			delete(name)
+		}
+		delete(p.arg_names)
 		delete(p.transpiled_sql)
 		delete(p.args_def)
 		delete(p.name)
